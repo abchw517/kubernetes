@@ -1,8 +1,36 @@
 # kubelet-resource-governance
 
+> v2.4.5 仅调整 Memory Profile 分档：继续直接使用 `/proc/meminfo` 的 `MemTotal` 原始 KiB 与 16/32/48/64/128GiB 阈值比较，不再先换算 GiB 后取整。`kubectl optional`、`crictl` Static Pod Check、`/configz`、快照和 rollback 逻辑保持不变。
+
+
 Kubernetes v1.34+ Kubelet 资源治理工具。该工具面向 kubeadm 节点，通过 `--config-dir` + KubeletConfiguration drop-in 管理企业级 kubelet 基线，不直接修改 `/var/lib/kubelet/config.yaml`。
 
-当前版本：**v2.4.3**。
+当前版本：**v2.4.5**。
+
+## v2.4.5 变更说明
+
+v2.4.5 **只调整 Memory Eviction Profile 分档**，不改 `kubectl optional`、`crictl` Static Pod Check、`/configz` Effective Config 校验、快照与 rollback 逻辑。
+
+v2.4.4 已经采用 `/proc/meminfo` 的 `MemTotal` 原始 KiB 直接判档；v2.4.5 在此基础上新增 `48Gi` 档：
+
+```text
+MemTotal KiB
+   │
+   ├─ <= 16 * 1048576  -> 16Gi Profile
+   ├─ <= 32 * 1048576  -> 32Gi Profile
+   ├─ <= 48 * 1048576  -> 48Gi Profile
+   ├─ <= 64 * 1048576  -> 64Gi Profile
+   └─ >  64 * 1048576  -> 128Gi Profile
+                              └─ >128Gi 仍按 128Gi 档封顶
+```
+
+例如标称 64GiB、Linux 实际可见内存约 63GiB 的节点，会稳定进入：
+
+```text
+detected=63Gi profile=64Gi soft=3072Mi hard=1536Mi
+```
+
+其中 `detected` 仅用于日志展示，`profile` 才是实际治理档位。
 
 ## 1. 设计目标
 
@@ -178,15 +206,29 @@ evictionHard:
 |---|---:|---:|
 | `<= 16 GiB` | `1024Mi` | `500Mi` |
 | `>16 && <=32 GiB` | `1536Mi` | `750Mi` |
-| `>32 && <=64 GiB` | `2048Mi` | `1024Mi` |
+| `>32 && <=48 GiB` | `2048Mi` | `1024Mi` |
+| `>48 && <=64 GiB` | `3072Mi` | `1536Mi` |
 | `>64 && <=128 GiB` | `4096Mi` | `2024Mi` |
 | `>128 GiB` | `4096Mi` | `2024Mi`（封顶） |
 
 节点内存来自：
 
 ```text
-/proc/meminfo -> MemTotal
+/proc/meminfo -> MemTotal (KiB)
 ```
+
+Profile 判断直接使用 `MemTotal` 原始 KiB：
+
+```text
+MemTotal <= 16 * 1048576 KiB  -> 16Gi Profile
+MemTotal <= 32 * 1048576 KiB  -> 32Gi Profile
+MemTotal <= 48 * 1048576 KiB  -> 48Gi Profile
+MemTotal <= 64 * 1048576 KiB  -> 64Gi Profile
+MemTotal <=128 * 1048576 KiB  -> 128Gi Profile
+MemTotal > 128 * 1048576 KiB  -> 128Gi Profile（封顶）
+```
+
+`NODE_MEMORY_GIB` 仅用于日志展示，不再参与档位判断。例如标称 64GiB 的节点，Linux 可能只显示约 63GiB；只要原始 `MemTotal` 不超过 64GiB 阈值，就稳定选择 `64Gi Profile / Soft=3072Mi / Hard=1536Mi`。
 
 源 YAML 永远不被运行时修改。脚本会生成临时 Effective Template，然后安装到 managed drop-in。
 
@@ -252,7 +294,7 @@ sudo ./kubelet-resource-governance.sh rollback --backup-id YYYYMMDD-HHMMSS-PID
 - CLI 高优先级覆盖冲突
 - drop-in 字典序冲突
 - 路径、owner、symlink 安全边界
-- 当前 Memory Profile
+- 当前检测内存（detected）与治理 Profile 档位
 
 不修改系统。
 
@@ -421,7 +463,7 @@ kubectl get --raw "/api/v1/nodes/$(hostname)/proxy/configz"
 ## 12. 文件清单
 
 ```text
-kubelet-resource-governance-v2.4.3/
+kubelet-resource-governance-v2.4.5/
 ├── kubelet-resource-governance.sh
 ├── kubelet-resource-governance.yaml
 ├── README.md

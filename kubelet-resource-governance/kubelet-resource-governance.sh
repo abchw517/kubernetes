@@ -2,7 +2,7 @@
 # ============================================================
 # kubelet-resource-governance.sh
 # Kubernetes v1.34+ Kubelet 资源治理工具
-# v2.4.3 - Local Core Validation + Optional Kubernetes API Verify
+# v2.4.4 - Memory Profile Boundary Fix
 #
 # 命令：check / diff / backup / apply [--dry-run] / status / rollback [--backup-id ID]
 # 设计：不修改 kubeadm 主配置；使用 --config-dir drop-in；写前快照；原子安装；失败回滚。
@@ -14,7 +14,7 @@ umask 027
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-VERSION="2.4.3"
+VERSION="2.4.5"
 COMMAND="${1:-help}"
 if (($# > 0)); then shift; fi
 
@@ -42,6 +42,7 @@ DRY_RUN="false"
 
 # Memory Eviction Profile：仅覆盖 evictionSoft/evictionHard 的 memory.available。
 NODE_MEMORY_GIB=0
+MEMORY_PROFILE=""
 EVICTION_SOFT_MEMORY=""
 EVICTION_HARD_MEMORY=""
 EFFECTIVE_TEMPLATE_FILE="$TEMPLATE_FILE"
@@ -411,6 +412,7 @@ precheck() {
 
 # 根据 /proc/meminfo 选择 Memory Eviction Profile。
 # 仅设置 evictionSoft.memory.available / evictionHard.memory.available。
+# 档位判断直接使用 MemTotal 原始 KiB，避免 GiB 取整造成跨档。
 select_memory_eviction_profile() {
     local mem_kib
     mem_kib="$(awk '$1=="MemTotal:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
@@ -419,21 +421,28 @@ select_memory_eviction_profile() {
         return 1
     }
 
-    # KiB -> GiB，向上取整，避免标称 16/32/64/128G 因保留内存误入较小档。
-    NODE_MEMORY_GIB=$(( (mem_kib + 1048575) / 1048576 ))
+    # 仅用于日志展示；Profile 决策只使用原始 KiB。
+    NODE_MEMORY_GIB=$(( mem_kib / 1048576 ))
 
-    if (( NODE_MEMORY_GIB <= 16 )); then
+    if (( mem_kib <= 16 * 1048576 )); then
+        MEMORY_PROFILE="16Gi"
         EVICTION_SOFT_MEMORY="1024Mi"; EVICTION_HARD_MEMORY="500Mi"
-    elif (( NODE_MEMORY_GIB <= 32 )); then
+    elif (( mem_kib <= 32 * 1048576 )); then
+        MEMORY_PROFILE="32Gi"
         EVICTION_SOFT_MEMORY="1536Mi"; EVICTION_HARD_MEMORY="750Mi"
-    elif (( NODE_MEMORY_GIB <= 64 )); then
+    elif (( mem_kib <= 48 * 1048576 )); then
+        MEMORY_PROFILE="48Gi"
         EVICTION_SOFT_MEMORY="2048Mi"; EVICTION_HARD_MEMORY="1024Mi"
+    elif (( mem_kib <= 64 * 1048576 )); then
+        MEMORY_PROFILE="64Gi"
+        EVICTION_SOFT_MEMORY="3072Mi"; EVICTION_HARD_MEMORY="1536Mi"
     else
+        MEMORY_PROFILE="128Gi"
         EVICTION_SOFT_MEMORY="4096Mi"; EVICTION_HARD_MEMORY="2024Mi"
     fi
 
-    info "Memory Profile: node=${NODE_MEMORY_GIB}Gi soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
-    (( NODE_MEMORY_GIB <= 128 )) || warn "Node Memory >128Gi，Memory Eviction Profile 按 128Gi 档封顶"
+    info "Memory Profile: detected=${NODE_MEMORY_GIB}Gi profile=${MEMORY_PROFILE} soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
+    (( mem_kib <= 128 * 1048576 )) || warn "Node Memory >128Gi，Memory Eviction Profile 按 128Gi 档封顶"
 }
 
 # 渲染本节点期望配置。只允许改两个 memory.available 字段；源 YAML 永不修改。
@@ -502,8 +511,8 @@ show_diff() {
     else
         printf '\n[systemd planned change]\n'; render_systemd_dropin
     fi
-    printf '\n[profile]\nnode memory: %sGi\nsoft       : %s\nhard       : %s\n' \
-        "$NODE_MEMORY_GIB" "$EVICTION_SOFT_MEMORY" "$EVICTION_HARD_MEMORY"
+    printf '\n[profile]\ndetected    : %sGi\nprofile     : %s\nsoft        : %s\nhard        : %s\n' \
+        "$NODE_MEMORY_GIB" "$MEMORY_PROFILE" "$EVICTION_SOFT_MEMORY" "$EVICTION_HARD_MEMORY"
     printf '\n[hash]\ndesired : %s\n' "$(sha256_of "$EFFECTIVE_TEMPLATE_FILE")"
     if [[ -f "$MANAGED_DROPIN" ]]; then printf 'current : %s\n' "$(sha256_of "$MANAGED_DROPIN")"
     else printf 'current : absent\n'; fi
@@ -519,7 +528,7 @@ dry_run_apply() {
 EOF_DRY
     precheck
     prepare_effective_template
-    info "[DRY-RUN] Memory Profile: node=${NODE_MEMORY_GIB}Gi soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
+    info "[DRY-RUN] Memory Profile: detected=${NODE_MEMORY_GIB}Gi profile=${MEMORY_PROFILE} soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
     info "[DRY-RUN] would snapshot: $BASE_CONFIG $MANAGED_DROPIN $SYSTEMD_DROPIN_FILE $TEMPLATE_FILE"
     if [[ -f "$MANAGED_DROPIN" ]]; then diff -u "$MANAGED_DROPIN" "$EFFECTIVE_TEMPLATE_FILE" || true
     else diff -u /dev/null "$EFFECTIVE_TEMPLATE_FILE" || true; fi
@@ -1029,7 +1038,7 @@ apply_command() {
     verify_applied
     APPLY_IN_PROGRESS="false"
     cleanup_old_snapshots
-    info "APPLY 成功；Memory Profile node=${NODE_MEMORY_GIB}Gi soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
+    info "APPLY 成功；Memory Profile detected=${NODE_MEMORY_GIB}Gi profile=${MEMORY_PROFILE} soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
     info "本次可回滚快照: $CURRENT_BACKUP_DIR"
     cleanup_profile_workdir
 }
@@ -1041,8 +1050,8 @@ status_command() {
 
     if prepare_effective_template; then
         profile_ready="true"
-        printf 'node memory          : %sGi\neviction soft memory : %s\neviction hard memory : %s\n' \
-            "$NODE_MEMORY_GIB" "$EVICTION_SOFT_MEMORY" "$EVICTION_HARD_MEMORY"
+        printf 'node memory detected : %sGi\nmemory profile       : %s\neviction soft memory : %s\neviction hard memory : %s\n' \
+            "$NODE_MEMORY_GIB" "$MEMORY_PROFILE" "$EVICTION_SOFT_MEMORY" "$EVICTION_HARD_MEMORY"
     else
         printf 'memory profile       : unavailable\n'; rc=1
     fi

@@ -1,4 +1,4 @@
-# kubelet-resource-governance v2.4.3
+# kubelet-resource-governance v2.4.5
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 
