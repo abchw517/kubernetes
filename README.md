@@ -7,7 +7,8 @@
 | 工具 | 说明 |
 |------|------|
 | [kubelet-resource-governance](./kubelet-resource-governance) | Kubelet 参数调优工具：以 drop-in 方式管理资源、驱逐、Image GC、容器日志等参数，支持 check / diff / apply / rollback，写前快照、失败回滚 |
-| pods 优雅删除迁移 | 按节点逐步驱逐并迁移 Pod，用于节点维护 / 腾挪场景，控制中断窗口 |
+| [pod-migrate](./pod-migrate) | Pod 平滑迁移工具（Shell / Python 双版本）：不改副本数、不整节点 drain，将指定节点上的 Deployment Pod 平滑迁到其他节点 |
+| [k8s-gray-scale-zero](./k8s-gray-scale-zero) | 灰度 Deployment 副本批量安全置零：校验正式 Deployment 健康 / 无 HPA 干预后分批缩容，支持观察窗口与回退 |
 
 ## 环境约定
 
