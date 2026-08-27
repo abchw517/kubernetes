@@ -306,7 +306,7 @@ evictionMaxPodGracePeriod: 60
 systemReserved:
 
   # 100m 适合小型基础配置，
-# 但高密度节点建议根据系统服务实际监控调整。
+  # 但高密度节点建议根据系统服务实际监控调整。
   cpu: "100m"
 
   memory: "1Gi"
