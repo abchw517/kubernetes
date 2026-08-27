@@ -1,0 +1,76 @@
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+
+# Kubernetes v1.34+ Kubelet Resource Governance Baseline
+# 作为 --config-dir 的“部分配置（drop-in）”使用；文件最终安装为 *.conf。
+# 仅声明需要治理的字段，未声明字段继承主配置/更低优先级 drop-in。
+
+# Pod / PID
+maxPods: 110
+podPidsLimit: 8192
+
+# API Server Client
+kubeAPIQPS: 50
+kubeAPIBurst: 100
+
+# Node 状态上报
+nodeStatusUpdateFrequency: 10s
+
+# Node Allocatable / 资源预留
+kubeReserved:
+  cpu: "500m"
+  memory: "1Gi"
+  ephemeral-storage: "1Gi"
+systemReserved:
+  cpu: "500m"
+  memory: "1Gi"
+  ephemeral-storage: "1Gi"
+
+# 默认仅约束 Pods；若加入 kube-reserved/system-reserved enforcement，
+# 必须同步设计 kubeReservedCgroup/systemReservedCgroup。
+enforceNodeAllocatable:
+  - pods
+
+# Node Pressure Eviction
+mergeDefaultEvictionSettings: true
+
+evictionSoft:
+  memory.available: "1024Mi"
+  nodefs.available: "15%"
+  imagefs.available: "20%"
+  nodefs.inodesFree: "10%"
+
+# P0 修复：每一个 evictionSoft signal 必须有对应 grace period。
+evictionSoftGracePeriod:
+  memory.available: "1m"
+  nodefs.available: "2m"
+  imagefs.available: "2m"
+  nodefs.inodesFree: "2m"
+
+evictionHard:
+  memory.available: "500Mi"
+  nodefs.available: "10%"
+  nodefs.inodesFree: "5%"
+  imagefs.available: "15%"
+  imagefs.inodesFree: "5%"
+
+evictionMinimumReclaim:
+  memory.available: "500Mi"
+  nodefs.available: "2Gi"
+  imagefs.available: "5Gi"
+
+evictionPressureTransitionPeriod: 5m
+evictionMaxPodGracePeriod: 60
+
+# Image GC
+imageMinimumGCAge: 5m
+imageGCHighThresholdPercent: 80
+imageGCLowThresholdPercent: 70
+
+# CRI Container Log Rotation
+containerLogMaxSize: "100Mi"
+containerLogMaxFiles: 5
+
+# Cgroup
+cgroupDriver: systemd
+cgroupsPerQOS: true
