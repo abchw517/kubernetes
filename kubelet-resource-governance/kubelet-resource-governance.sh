@@ -2,7 +2,7 @@
 # ============================================================
 # kubelet-resource-governance.sh
 # Kubernetes v1.34+ Kubelet 资源治理工具
-# v2.3.1 - P0/P1 Production Hardening + P2 Baseline Adjustment
+# v2.4.3 - Local Core Validation + Optional Kubernetes API Verify
 #
 # 命令：check / diff / backup / apply [--dry-run] / status / rollback [--backup-id ID]
 # 设计：不修改 kubeadm 主配置；使用 --config-dir drop-in；写前快照；原子安装；失败回滚。
@@ -14,7 +14,7 @@ umask 027
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-VERSION="2.3.1"
+VERSION="2.4.3"
 COMMAND="${1:-help}"
 if (($# > 0)); then shift; fi
 
@@ -39,6 +39,13 @@ APPLY_IN_PROGRESS="false"
 ROLLBACK_IN_PROGRESS="false"
 ROLLBACK_ID=""
 DRY_RUN="false"
+
+# Memory Eviction Profile：仅覆盖 evictionSoft/evictionHard 的 memory.available。
+NODE_MEMORY_GIB=0
+EVICTION_SOFT_MEMORY=""
+EVICTION_HARD_MEMORY=""
+EFFECTIVE_TEMPLATE_FILE="$TEMPLATE_FILE"
+PROFILE_WORKDIR=""
 
 while (($#)); do
     case "$1" in
@@ -94,11 +101,11 @@ ${SCRIPT_NAME} v${VERSION}
 
 命令：
   check       版本、模板、systemd、CLI 冲突、路径安全检查；不修改系统
-  diff        显示受管 drop-in 与模板差异，并预览 systemd 变化
+  diff        根据本机内存 Profile 显示受管 drop-in 与期望配置差异
   backup      创建独立快照；默认仅保留最近 ${SNAPSHOT_RETENTION_COUNT} 个有效快照
   apply       precheck -> 健康门禁 -> backup -> install -> restart -> verify
   apply --dry-run  完整预演，不写文件、不 reload/restart、不创建正式快照
-  status      查看 kubelet、healthz、Node、config-dir、漂移和快照状态
+  status      查看 kubelet、Memory Profile、healthz、config-dir、漂移；API 可用时附加 Node Ready
   rollback    回滚最近或指定快照
 
 主要环境变量：
@@ -177,14 +184,52 @@ sha256_of() {
     else printf 'unavailable\n'; fi
 }
 get_execstart() { systemctl show kubelet -p ExecStart --value 2>/dev/null || true; }
+get_systemd_environment() { systemctl show kubelet -p Environment --value 2>/dev/null || true; }
 get_unit_text() { systemctl cat kubelet 2>/dev/null || true; }
 
-get_config_dir_from_execstart() {
-    local token execstart="$(get_execstart)"
-    token="$(grep -oE -- '--config-dir(=|[[:space:]])[^[:space:];}]+' <<<"$execstart" | head -n1 || true)"
+# 获取运行中 kubelet 的真实 argv。systemd 的 ExecStart 可能仍显示 $KUBELET_CONFIG_ARGS，
+# 因此 apply 后验证优先读取 /proc/<MainPID>/cmdline。
+get_kubelet_runtime_cmdline() {
+    local pid
+    pid="$(systemctl show kubelet -p MainPID --value 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    (( pid > 0 )) || return 1
+    [[ -r "/proc/${pid}/cmdline" ]] || return 1
+    tr '\0' ' ' <"/proc/${pid}/cmdline"
+    printf '\n'
+}
+
+extract_config_dir_from_text() {
+    local text="$1" token
+    token="$(grep -oE -- '--config-dir(=|[[:space:]])[^[:space:];}]+' <<<"$text" | head -n1 || true)"
     [[ -n "$token" ]] || return 1
     token="${token#--config-dir=}"; token="${token#--config-dir }"
+    token="${token%\"}"; token="${token%\'}"
+    [[ -n "$token" ]] || return 1
     printf '%s\n' "$token"
+}
+
+# kubelet --config-dir 检测优先级：
+# 1. 运行中 kubelet 的真实 argv；2. systemd Environment；3. systemd ExecStart。
+get_effective_config_dir() {
+    local value
+    value="$(get_kubelet_runtime_cmdline 2>/dev/null || true)"
+    [[ -n "$value" ]] && extract_config_dir_from_text "$value" && return 0
+
+    value="$(get_systemd_environment)"
+    [[ -n "$value" ]] && extract_config_dir_from_text "$value" && return 0
+
+    value="$(get_execstart)"
+    [[ -n "$value" ]] && extract_config_dir_from_text "$value" && return 0
+    return 1
+}
+
+get_kubelet_effective_cli_text() {
+    {
+        get_kubelet_runtime_cmdline 2>/dev/null || true
+        get_systemd_environment 2>/dev/null || true
+        get_execstart 2>/dev/null || true
+    }
 }
 
 version_ge_134() {
@@ -293,7 +338,7 @@ check_base_config() {
 
 # CLI 参数优先级高于 config/config-dir；覆盖模板字段时拒绝 apply。
 check_cli_conflicts() {
-    local execstart="$(get_execstart)" conflict=0 flag
+    local execstart="$(get_kubelet_effective_cli_text)" conflict=0 flag
     local flags=(
         --max-pods --pod-max-pids
         --eviction-soft --eviction-soft-grace-period --eviction-hard
@@ -329,7 +374,7 @@ check_dropin_order() {
 check_systemd_compatibility() {
     local unit="$(get_unit_text)" effective_dir config_args
     [[ -n "$unit" ]] || { error "无法读取 kubelet systemd unit"; return 1; }
-    if effective_dir="$(get_config_dir_from_execstart 2>/dev/null)"; then
+    if effective_dir="$(get_effective_config_dir 2>/dev/null)"; then
         [[ "$(canonical_path "$effective_dir")" == "$(canonical_path "$DROPIN_DIR")" ]] || {
             error "kubelet 已使用其他 --config-dir: $effective_dir"; return 1;
         }
@@ -360,7 +405,77 @@ precheck() {
     check_dropin_order
     if systemctl is-active --quiet kubelet; then info "kubelet 当前状态: active"
     else warn "kubelet 当前非 active；check 仅报告，正式 apply 将拒绝执行"; fi
+    select_memory_eviction_profile
     info "CHECK 完成：未修改系统配置"
+}
+
+# 根据 /proc/meminfo 选择 Memory Eviction Profile。
+# 仅设置 evictionSoft.memory.available / evictionHard.memory.available。
+select_memory_eviction_profile() {
+    local mem_kib
+    mem_kib="$(awk '$1=="MemTotal:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+    [[ "$mem_kib" =~ ^[1-9][0-9]*$ ]] || {
+        error "无法从 /proc/meminfo 获取有效 MemTotal"
+        return 1
+    }
+
+    # KiB -> GiB，向上取整，避免标称 16/32/64/128G 因保留内存误入较小档。
+    NODE_MEMORY_GIB=$(( (mem_kib + 1048575) / 1048576 ))
+
+    if (( NODE_MEMORY_GIB <= 16 )); then
+        EVICTION_SOFT_MEMORY="1024Mi"; EVICTION_HARD_MEMORY="500Mi"
+    elif (( NODE_MEMORY_GIB <= 32 )); then
+        EVICTION_SOFT_MEMORY="1536Mi"; EVICTION_HARD_MEMORY="750Mi"
+    elif (( NODE_MEMORY_GIB <= 64 )); then
+        EVICTION_SOFT_MEMORY="2048Mi"; EVICTION_HARD_MEMORY="1024Mi"
+    else
+        EVICTION_SOFT_MEMORY="4096Mi"; EVICTION_HARD_MEMORY="2024Mi"
+    fi
+
+    info "Memory Profile: node=${NODE_MEMORY_GIB}Gi soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
+    (( NODE_MEMORY_GIB <= 128 )) || warn "Node Memory >128Gi，Memory Eviction Profile 按 128Gi 档封顶"
+}
+
+# 渲染本节点期望配置。只允许改两个 memory.available 字段；源 YAML 永不修改。
+render_memory_profile_template() {
+    local src="$1" dst="$2"
+    awk -v soft="$EVICTION_SOFT_MEMORY" -v hard="$EVICTION_HARD_MEMORY" '
+        /^evictionSoft:[[:space:]]*$/ { section="soft"; print; next }
+        /^evictionHard:[[:space:]]*$/ { section="hard"; print; next }
+        /^[^[:space:]#][^:]*:/ { section="" }
+        section=="soft" && /^[[:space:]]+memory\.available:[[:space:]]*/ {
+            print "  memory.available: \"" soft "\""; soft_count++; next
+        }
+        section=="hard" && /^[[:space:]]+memory\.available:[[:space:]]*/ {
+            print "  memory.available: \"" hard "\""; hard_count++; next
+        }
+        { print }
+        END { if (soft_count != 1 || hard_count != 1) exit 42 }
+    ' "$src" >"$dst" || {
+        rm -f -- "$dst"
+        error "Memory Profile 渲染失败：必须且只能找到 evictionSoft/evictionHard 各一个 memory.available"
+        return 1
+    }
+}
+
+prepare_effective_template() {
+    local dir="${1:-}"
+    select_memory_eviction_profile
+    if [[ -z "$dir" ]]; then
+        PROFILE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/kubelet-resource-governance.profile.XXXXXX")"
+        dir="$PROFILE_WORKDIR"
+    fi
+    EFFECTIVE_TEMPLATE_FILE="${dir}/99-resource-governance.conf"
+    render_memory_profile_template "$TEMPLATE_FILE" "$EFFECTIVE_TEMPLATE_FILE"
+    chmod 0600 "$EFFECTIVE_TEMPLATE_FILE"
+}
+
+cleanup_profile_workdir() {
+    if [[ -n "$PROFILE_WORKDIR" && -d "$PROFILE_WORKDIR" ]]; then
+        rm -rf -- "$PROFILE_WORKDIR"
+    fi
+    PROFILE_WORKDIR=""
+    EFFECTIVE_TEMPLATE_FILE="$TEMPLATE_FILE"
 }
 
 render_systemd_dropin() {
@@ -372,21 +487,27 @@ EOF_SYSTEMD
 
 show_diff() {
     validate_template
+    prepare_effective_template
     info "========== Kubelet Resource Governance Diff =========="
     if [[ -f "$MANAGED_DROPIN" ]]; then
-        diff -u --label "current:${MANAGED_DROPIN}" --label "desired:${TEMPLATE_FILE}" "$MANAGED_DROPIN" "$TEMPLATE_FILE" || true
+        diff -u --label "current:${MANAGED_DROPIN}" --label "desired:memory-profile" \
+            "$MANAGED_DROPIN" "$EFFECTIVE_TEMPLATE_FILE" || true
     else
-        diff -u --label "current:/dev/null" --label "desired:${TEMPLATE_FILE}" /dev/null "$TEMPLATE_FILE" || true
+        diff -u --label "current:/dev/null" --label "desired:memory-profile" \
+            /dev/null "$EFFECTIVE_TEMPLATE_FILE" || true
     fi
     local effective_dir
-    if effective_dir="$(get_config_dir_from_execstart 2>/dev/null)"; then
+    if effective_dir="$(get_effective_config_dir 2>/dev/null)"; then
         printf '\n[systemd]\n已启用 --config-dir=%s\n' "$effective_dir"
     else
         printf '\n[systemd planned change]\n'; render_systemd_dropin
     fi
-    printf '\n[hash]\ntemplate: %s\n' "$(sha256_of "$TEMPLATE_FILE")"
+    printf '\n[profile]\nnode memory: %sGi\nsoft       : %s\nhard       : %s\n' \
+        "$NODE_MEMORY_GIB" "$EVICTION_SOFT_MEMORY" "$EVICTION_HARD_MEMORY"
+    printf '\n[hash]\ndesired : %s\n' "$(sha256_of "$EFFECTIVE_TEMPLATE_FILE")"
     if [[ -f "$MANAGED_DROPIN" ]]; then printf 'current : %s\n' "$(sha256_of "$MANAGED_DROPIN")"
     else printf 'current : absent\n'; fi
+    cleanup_profile_workdir
     info "DIFF 完成：未修改系统配置"
 }
 
@@ -397,20 +518,19 @@ dry_run_apply() {
 ============================================================
 EOF_DRY
     precheck
+    prepare_effective_template
+    info "[DRY-RUN] Memory Profile: node=${NODE_MEMORY_GIB}Gi soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
     info "[DRY-RUN] would snapshot: $BASE_CONFIG $MANAGED_DROPIN $SYSTEMD_DROPIN_FILE $TEMPLATE_FILE"
-    local workdir="$(mktemp -d "${TMPDIR:-/tmp}/kubelet-resource-governance.XXXXXX")" rendered effective_dir
-    trap 'rm -rf -- "$workdir"' RETURN
-    rendered="${workdir}/99-resource-governance.conf"
-    cp -- "$TEMPLATE_FILE" "$rendered"; chmod 0644 "$rendered"
-    if [[ -f "$MANAGED_DROPIN" ]]; then diff -u "$MANAGED_DROPIN" "$rendered" || true
-    else diff -u /dev/null "$rendered" || true; fi
-    if ! effective_dir="$(get_config_dir_from_execstart 2>/dev/null)"; then
+    if [[ -f "$MANAGED_DROPIN" ]]; then diff -u "$MANAGED_DROPIN" "$EFFECTIVE_TEMPLATE_FILE" || true
+    else diff -u /dev/null "$EFFECTIVE_TEMPLATE_FILE" || true; fi
+    local effective_dir
+    if ! effective_dir="$(get_effective_config_dir 2>/dev/null)"; then
         printf '\n[DRY-RUN systemd]\n'; render_systemd_dropin
     fi
     info "[DRY-RUN] would atomically install $MANAGED_DROPIN"
     info "[DRY-RUN] would daemon-reload + restart kubelet"
-    info "[DRY-RUN] would verify systemd + effective healthz + Node Ready/API（可用时）+ /configz（可用时）"
-    rm -rf -- "$workdir"; trap - RETURN
+    info "[DRY-RUN] would verify systemd + healthz + Node Ready/API（可用时）+ /configz（可用时）"
+    cleanup_profile_workdir
 }
 
 validate_snapshot_retention() {
@@ -498,10 +618,23 @@ atomic_render_systemd_dropin() {
     fi
 }
 install_desired_config() {
-    info "原子安装治理 Drop-in: $MANAGED_DROPIN"; atomic_copy "$TEMPLATE_FILE" "$MANAGED_DROPIN" 0644
-    if ! get_config_dir_from_execstart >/dev/null 2>&1; then
-        info "创建 systemd Drop-in，启用 --config-dir=${DROPIN_DIR}"; atomic_render_systemd_dropin
-    else info "kubelet 已启用 --config-dir，无需新增 systemd Drop-in"; fi
+    local effective_dir=""
+    info "原子安装治理 Drop-in: $MANAGED_DROPIN"
+    atomic_copy "$EFFECTIVE_TEMPLATE_FILE" "$MANAGED_DROPIN" 0644
+
+    effective_dir="$(get_effective_config_dir 2>/dev/null || true)"
+    if [[ -z "$effective_dir" ]]; then
+        info "当前 kubelet 未检测到 --config-dir，按需创建 systemd Drop-in: $SYSTEMD_DROPIN_FILE"
+        info "注入 --config-dir=${DROPIN_DIR}"
+        atomic_render_systemd_dropin
+        return 0
+    fi
+
+    if [[ "$(canonical_path "$effective_dir")" != "$(canonical_path "$DROPIN_DIR")" ]]; then
+        error "现有 --config-dir 与治理目录不一致: actual=${effective_dir} expected=${DROPIN_DIR}"
+        return 1
+    fi
+    info "kubelet 已启用目标 --config-dir=${effective_dir}，无需新增 systemd Drop-in"
 }
 
 # 用 base + *.conf 字典序解析简单顶层 scalar，动态确定 healthz 地址。
@@ -517,7 +650,7 @@ effective_top_scalar() {
     printf '%s\n' "$value"
 }
 get_cli_flag_value() {
-    local flag="$1" token execstart="$(get_execstart)"
+    local flag="$1" token execstart="$(get_kubelet_effective_cli_text)"
     token="$(grep -oE -- "${flag}(=|[[:space:]])[^[:space:];}]+" <<<"$execstart" | head -n1 || true)"
     [[ -n "$token" ]] || return 1
     token="${token#${flag}=}"; token="${token#${flag} }"
@@ -548,63 +681,239 @@ wait_local_health() {
     error "kubelet healthz 在 ${NODE_READY_TIMEOUT}s 内未恢复: $url"; return 1
 }
 
-resolve_node_name() {
-    local candidate override execstart="$(get_execstart)"
+get_local_node_name() {
+    local override cli
+    cli="$(get_kubelet_effective_cli_text)"
+    override="$(grep -oE -- '--hostname-override(=|[[:space:]])[^[:space:];}]+' <<<"$cli" | head -n1 || true)"
+    override="${override#--hostname-override=}"; override="${override#--hostname-override }"
+    if [[ -n "$override" ]]; then printf '%s\n' "$override"; else hostname; fi
+}
+
+# Kubernetes API 仅用于增强验证；kubectl 存在但没有可用 kubeconfig 时视为不可用，不影响核心 apply。
+kubernetes_api_available() {
     command -v kubectl >/dev/null 2>&1 || return 1
-    override="$(grep -oE -- '--hostname-override(=|[[:space:]])[^[:space:];}]+' <<<"$execstart" | head -n1 || true)"
+    kubectl get --raw='/readyz' --request-timeout=5s >/dev/null 2>&1
+}
+
+resolve_node_name() {
+    kubernetes_api_available || return 1
+    local candidate override cli="$(get_kubelet_effective_cli_text)"
+    override="$(grep -oE -- '--hostname-override(=|[[:space:]])[^[:space:];}]+' <<<"$cli" | head -n1 || true)"
     override="${override#--hostname-override=}"; override="${override#--hostname-override }"
     for candidate in "$override" "$(hostname)" "$(hostname -s)" "$(hostname -f 2>/dev/null || true)"; do
         [[ -n "$candidate" ]] || continue
-        kubectl get node "$candidate" >/dev/null 2>&1 && { printf '%s\n' "$candidate"; return 0; }
+        kubectl get node "$candidate" --request-timeout=5s >/dev/null 2>&1 && { printf '%s\n' "$candidate"; return 0; }
     done
     return 1
 }
+
 node_ready_once() {
-    command -v kubectl >/dev/null 2>&1 || { warn "kubectl 不可用，Node Ready 门禁降级"; return 2; }
-    local node ready; node="$(resolve_node_name)" || { error "kubectl 可用但无法定位本机 Node"; return 1; }
-    ready="$(kubectl get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+    if ! kubernetes_api_available; then warn "Kubernetes API 不可用，Node Ready 门禁降级为本地 healthz"; return 2; fi
+    local node ready
+    if ! node="$(resolve_node_name)"; then warn "Kubernetes API 可用但无法定位本机 Node，跳过 Node Ready 增强检查"; return 2; fi
+    ready="$(kubectl get node "$node" --request-timeout=5s -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
     [[ "$ready" == "True" ]] || { error "Node 当前非 Ready: $node status=${ready:-unknown}"; return 1; }
 }
+
 wait_node_ready() {
-    if ! command -v kubectl >/dev/null 2>&1; then warn "kubectl 不可用，跳过 Node Ready API 检查"; return 0; fi
-    local node elapsed=0 ready; node="$(resolve_node_name)" || { error "kubectl 可用但无法定位本机 Node"; return 1; }
+    if ! kubernetes_api_available; then warn "Kubernetes API 不可用，跳过 Node Ready 增强检查"; return 0; fi
+    local node elapsed=0 ready
+    if ! node="$(resolve_node_name)"; then warn "Kubernetes API 可用但无法定位本机 Node，跳过 Node Ready 增强检查"; return 0; fi
     while (( elapsed < NODE_READY_TIMEOUT )); do
-        ready="$(kubectl get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-        [[ "$ready" == "True" ]] && { info "Node Ready 检查通过: $node"; return 0; }
+        ready="$(kubectl get node "$node" --request-timeout=5s -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+        [[ "$ready" == "True" ]] && { info "Node Ready 增强检查通过: $node"; return 0; }
         sleep "$HEALTH_INTERVAL"; elapsed=$((elapsed + HEALTH_INTERVAL))
     done
     error "Node ${node} 在 ${NODE_READY_TIMEOUT}s 内未恢复 Ready"; return 1
 }
 
-# /configz 字段级校验：kubectl + python3/PyYAML 可用时为强校验；否则明确降级。
+# /configz 字段级校验：Kubernetes API 可用时执行增强验证；不可用时明确降级。
+# Duration 字段按 Go/Kubernetes 时长语义比较，例如 5m == 5m0s == 300s。
 verify_effective_config() {
-    if ! command -v kubectl >/dev/null 2>&1; then warn "kubectl 不可用，跳过 /configz 校验"; return 0; fi
+    if ! kubernetes_api_available; then
+        warn "Kubernetes API 不可用，跳过 /configz Effective Config 增强校验"
+        return 0
+    fi
     if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import yaml' >/dev/null 2>&1; then
-        warn "缺少 python3+PyYAML，跳过 /configz 字段级校验"; return 0
+        warn "缺少 python3+PyYAML，跳过 /configz Effective Config 校验"
+        return 0
     fi
-    local node tmp; node="$(resolve_node_name)" || { error "无法定位 Node，不能执行 /configz 校验"; return 1; }
-    tmp="$(mktemp "${TMPDIR:-/tmp}/kubelet-configz.XXXXXX")"
-    if ! kubectl get --raw "/api/v1/nodes/${node}/proxy/configz" >"$tmp" 2>/dev/null; then
-        rm -f -- "$tmp"; error "无法通过 Kubernetes API 获取 ${node}/configz"; return 1
+
+    local node configz
+    if ! node="$(resolve_node_name)"; then
+        warn "无法定位本机 Node，跳过 /configz Effective Config 增强校验"
+        return 0
     fi
-    if ! python3 - "$TEMPLATE_FILE" "$tmp" <<'PY_CONFIGZ'
-import json, sys, yaml
-with open(sys.argv[1], encoding='utf-8') as f: desired=yaml.safe_load(f)
-with open(sys.argv[2], encoding='utf-8') as f: raw=json.load(f)
-effective=raw.get('kubeletconfig', raw.get('kubeletConfig', raw))
-failed=[]
+
+    if ! configz="$(kubectl get --raw "/api/v1/nodes/${node}/proxy/configz" --request-timeout=5s 2>/dev/null)"; then
+        warn "无法通过 Kubernetes API 获取 ${node}/configz，跳过增强校验"
+        return 0
+    fi
+    [[ -n "$configz" ]] || { warn "${node}/configz 返回空内容，跳过增强校验"; return 0; }
+
+    # JSON 通过 stdin 传入；Python 源码使用 FD 3，避免临时文件及 heredoc 占用 stdin。
+    if ! printf '%s' "$configz" | python3 /dev/fd/3 "$EFFECTIVE_TEMPLATE_FILE" 3<<'PY_CONFIGZ'
+import json
+import re
+import sys
+from decimal import Decimal, InvalidOperation
+
+import yaml
+
+# Duration 按语义比较；Memory Profile 统一使用 Mi，仅兼容 /configz 的 Gi 规范化输出。
+DURATION_FIELDS = {
+    "nodeStatusUpdateFrequency",
+    "evictionPressureTransitionPeriod",
+    "imageMinimumGCAge",
+    "imageMaximumGCAge",
+}
+DURATION_MAP_FIELDS = {"evictionSoftGracePeriod"}
+MEMORY_PATHS = {
+    "evictionSoft.memory.available",
+    "evictionHard.memory.available",
+}
+TOKEN = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|μs|ms|s|m|h)")
+MEMORY_TOKEN = re.compile(r"([0-9]+)(Mi|Gi)")
+FACTORS = {
+    "ns": Decimal(1), "us": Decimal(1_000), "µs": Decimal(1_000), "μs": Decimal(1_000),
+    "ms": Decimal(1_000_000), "s": Decimal(1_000_000_000),
+    "m": Decimal(60_000_000_000), "h": Decimal(3_600_000_000_000),
+}
+
+
+def duration_ns(value):
+    if not isinstance(value, str) or not value:
+        return None
+    pos, total = 0, Decimal(0)
+    try:
+        for match in TOKEN.finditer(value):
+            if match.start() != pos:
+                return None
+            total += Decimal(match.group(1)) * FACTORS[match.group(2)]
+            pos = match.end()
+    except InvalidOperation:
+        return None
+    return total if pos == len(value) and pos > 0 else None
+
+
+def memory_mib(value):
+    # Profile/template 始终使用 Mi；仅兼容 kubelet /configz 可能规范化成 Gi。
+    if not isinstance(value, str):
+        return None
+    match = MEMORY_TOKEN.fullmatch(value)
+    if not match:
+        return None
+    number = int(match.group(1))
+    return number if match.group(2) == "Mi" else number * 1024
+
+
+def compare(path, root, desired, actual):
+    if isinstance(desired, dict):
+        if not isinstance(actual, dict):
+            return [(path, desired, actual)]
+        failed = []
+        for key, want in desired.items():
+            child = f"{path}.{key}" if path else key
+            if key not in actual:
+                failed.append((child, want, "<missing>"))
+            else:
+                failed.extend(compare(child, root, want, actual[key]))
+        return failed
+
+    if isinstance(desired, list):
+        return [] if desired == actual else [(path, desired, actual)]
+
+    if root in DURATION_FIELDS or root in DURATION_MAP_FIELDS:
+        want_ns, got_ns = duration_ns(desired), duration_ns(actual)
+        if want_ns is not None and got_ns is not None:
+            return [] if want_ns == got_ns else [(path, desired, actual)]
+        # Duration 无法解析时回落到严格比较，避免静默放过异常值。
+
+    if path in MEMORY_PATHS:
+        want_mib, got_mib = memory_mib(desired), memory_mib(actual)
+        if want_mib is not None and got_mib is not None:
+            return [] if want_mib == got_mib else [(path, desired, actual)]
+        # 无法识别的容量格式回落到严格比较。
+
+    return [] if desired == actual else [(path, desired, actual)]
+
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        desired = yaml.safe_load(f)
+    raw = json.load(sys.stdin)
+except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+    print(f"configz validation input error: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+effective = raw.get("kubeletconfig", raw.get("kubeletConfig", raw))
+if not isinstance(desired, dict) or not isinstance(effective, dict):
+    print("invalid desired/effective kubelet configuration structure", file=sys.stderr)
+    raise SystemExit(1)
+
+failed = []
 for key, want in desired.items():
-    if key in {'apiVersion','kind'}: continue
-    got=effective.get(key, '<missing>')
-    if got != want: failed.append((key, want, got))
+    if key in {"apiVersion", "kind"}:
+        continue
+    if key not in effective:
+        failed.append((key, want, "<missing>"))
+    else:
+        failed.extend(compare(key, key, want, effective[key]))
+
 if failed:
-    for key,want,got in failed: print(f"mismatch {key}: desired={want!r} actual={got!r}", file=sys.stderr)
+    for path, want, got in failed:
+        print(f"mismatch {path}: desired={want!r} actual={got!r}", file=sys.stderr)
     raise SystemExit(1)
 PY_CONFIGZ
     then
-        rm -f -- "$tmp"; error "Effective Config 与模板声明字段不一致"; return 1
+        error "Effective Config 与模板声明字段不一致"
+        return 1
     fi
-    rm -f -- "$tmp"; info "Effective Config (/configz) 校验通过: $node"
+
+    info "Effective Config (/configz) 语义校验通过: ${node}"
+}
+
+# Control Plane Static Pod 健康检查：仅检查本机实际存在的 kubeadm static pod manifest。
+# 仅使用可用的 CRI 检查真实运行容器；crictl 不可用时明确降级跳过。
+check_control_plane_static_pods() {
+    local manifest_dir="/etc/kubernetes/manifests" component container_ids elapsed=0
+    local component_list failed_list
+    local -a components=() failed=()
+
+    for component in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+        [[ -f "${manifest_dir}/${component}.yaml" ]] && components+=("$component")
+    done
+
+    ((${#components[@]} > 0)) || {
+        info "未检测到 kubeadm Control Plane static pod manifest，跳过 Control Plane 健康检查"
+        return 0
+    }
+
+    component_list="$(IFS=,; printf '%s' "${components[*]}")"
+    info "检测到 Control Plane static pods: ${component_list}"
+
+    if ! command -v crictl >/dev/null 2>&1 || ! crictl info >/dev/null 2>&1; then
+        warn "crictl 不可用或无法连接 CRI，跳过 Control Plane Static Pod 增强检查"
+        return 0
+    fi
+
+    info "Control Plane 健康检查方式: CRI runtime"
+    while (( elapsed < NODE_READY_TIMEOUT )); do
+        failed=()
+        for component in "${components[@]}"; do
+            container_ids="$(crictl ps --state Running --name "$component" -q 2>/dev/null || true)"
+            [[ -n "$container_ids" ]] || failed+=("$component")
+        done
+        if ((${#failed[@]} == 0)); then
+            info "Control Plane Static Pod 健康检查通过: ${component_list}"
+            return 0
+        fi
+        sleep "$HEALTH_INTERVAL"; elapsed=$((elapsed + HEALTH_INTERVAL))
+    done
+
+    failed_list="$(IFS=,; printf '%s' "${failed[*]}")"
+    error "Control Plane Static Pod 在 ${NODE_READY_TIMEOUT}s 内未全部恢复 Running: ${failed_list}"
+    return 1
 }
 
 preapply_health_gate() {
@@ -623,15 +932,25 @@ verify_applied() {
     systemctl is-active --quiet kubelet || {
         error "kubelet service 非 active"; journalctl -u kubelet -n 80 --no-pager >&2 || true; return 1;
     }
-    local effective_dir="$(get_config_dir_from_execstart 2>/dev/null || true)"
-    [[ "$(canonical_path "${effective_dir:-/nonexistent}")" == "$(canonical_path "$DROPIN_DIR")" ]] || {
-        error "实际 --config-dir 不符合预期: ${effective_dir:-absent}"; return 1;
+    local effective_dir="$(get_effective_config_dir 2>/dev/null || true)"
+    if [[ -z "$effective_dir" ]]; then
+        error "无法从 kubelet Runtime argv / systemd Environment / ExecStart 获取 --config-dir"
+        error "期望 --config-dir=${DROPIN_DIR}"
+        error "Runtime argv: $(get_kubelet_runtime_cmdline 2>/dev/null || echo unavailable)"
+        error "systemd Environment: $(get_systemd_environment 2>/dev/null || echo unavailable)"
+        error "systemd ExecStart: $(get_execstart 2>/dev/null || echo unavailable)"
+        return 1
+    fi
+    [[ "$(canonical_path "$effective_dir")" == "$(canonical_path "$DROPIN_DIR")" ]] || {
+        error "实际 --config-dir 不符合预期: actual=${effective_dir} expected=${DROPIN_DIR}"; return 1;
     }
+    info "kubelet --config-dir 验证通过: ${effective_dir}"
     [[ -f "$MANAGED_DROPIN" ]] || { error "受管 Drop-in 不存在: $MANAGED_DROPIN"; return 1; }
-    cmp -s "$MANAGED_DROPIN" "$TEMPLATE_FILE" || { error "受管 Drop-in 与模板不一致"; return 1; }
+    cmp -s "$MANAGED_DROPIN" "$EFFECTIVE_TEMPLATE_FILE" || { error "受管 Drop-in 与本节点 Memory Profile 期望配置不一致"; return 1; }
     wait_local_health
     wait_node_ready
     verify_effective_config
+    check_control_plane_static_pods
     info "应用后验证全部通过"
 }
 
@@ -698,48 +1017,65 @@ apply_command() {
     require_root; acquire_lock
     precheck
     preapply_health_gate
+    prepare_effective_template
     create_backup apply >/dev/null
     APPLY_IN_PROGRESS="true"
-    info "再次校验模板，防止 backup 后模板变化"; validate_template
+    info "再次校验源模板，防止 backup 后模板变化"; validate_template
+    # 重新渲染，确保 backup 后源模板变化不会绕过 Profile 计算。
+    render_memory_profile_template "$TEMPLATE_FILE" "$EFFECTIVE_TEMPLATE_FILE"
     install_desired_config
     info "执行 systemctl daemon-reload"; systemctl daemon-reload
     info "执行 systemctl restart kubelet"; systemctl restart kubelet
     verify_applied
     APPLY_IN_PROGRESS="false"
     cleanup_old_snapshots
-    info "APPLY 成功；本次可回滚快照: $CURRENT_BACKUP_DIR"
+    info "APPLY 成功；Memory Profile node=${NODE_MEMORY_GIB}Gi soft=${EVICTION_SOFT_MEMORY} hard=${EVICTION_HARD_MEMORY}"
+    info "本次可回滚快照: $CURRENT_BACKUP_DIR"
+    cleanup_profile_workdir
 }
 
 status_command() {
-    local rc=0 effective_dir="" node="" ready="unknown" health="unknown" latest="" hurl=""
+    local rc=0 effective_dir="" node="" ready="unknown" health="unknown" latest="" hurl="" profile_ready="false"
     printf '=== kubelet-resource-governance status ===\nversion             : %s\n' "$VERSION"
     printf 'template            : %s\nmanaged drop-in      : %s\nbackup root          : %s\n' "$TEMPLATE_FILE" "$MANAGED_DROPIN" "$BACKUP_ROOT"
+
+    if prepare_effective_template; then
+        profile_ready="true"
+        printf 'node memory          : %sGi\neviction soft memory : %s\neviction hard memory : %s\n' \
+            "$NODE_MEMORY_GIB" "$EVICTION_SOFT_MEMORY" "$EVICTION_HARD_MEMORY"
+    else
+        printf 'memory profile       : unavailable\n'; rc=1
+    fi
+
     if command -v kubelet >/dev/null 2>&1; then printf 'kubelet version      : %s\n' "$(kubelet --version 2>/dev/null || echo unknown)"
     else printf 'kubelet version      : missing\n'; rc=1; fi
     if systemctl is-active --quiet kubelet 2>/dev/null; then printf 'kubelet service      : active\n'
     else printf 'kubelet service      : NOT ACTIVE\n'; rc=1; fi
-    effective_dir="$(get_config_dir_from_execstart 2>/dev/null || true)"
+    effective_dir="$(get_effective_config_dir 2>/dev/null || true)"
     printf 'effective config-dir : %s\n' "${effective_dir:-absent}"
     [[ -n "$effective_dir" && "$(canonical_path "$effective_dir" 2>/dev/null || true)" == "$(canonical_path "$DROPIN_DIR" 2>/dev/null || true)" ]] || rc=1
-    if [[ -f "$MANAGED_DROPIN" ]]; then
-        printf 'managed sha256       : %s\ntemplate sha256      : %s\n' "$(sha256_of "$MANAGED_DROPIN")" "$(sha256_of "$TEMPLATE_FILE")"
-        if cmp -s "$MANAGED_DROPIN" "$TEMPLATE_FILE"; then printf 'config drift         : no\n'
+
+    if [[ "$profile_ready" == "true" && -f "$MANAGED_DROPIN" && -f "$EFFECTIVE_TEMPLATE_FILE" ]]; then
+        printf 'managed sha256       : %s\ndesired sha256       : %s\n' "$(sha256_of "$MANAGED_DROPIN")" "$(sha256_of "$EFFECTIVE_TEMPLATE_FILE")"
+        if cmp -s "$MANAGED_DROPIN" "$EFFECTIVE_TEMPLATE_FILE"; then printf 'config drift         : no\n'
         else printf 'config drift         : YES\n'; rc=1; fi
-    else printf 'managed config       : absent\n'; rc=1; fi
+    else printf 'managed config       : absent/unavailable\n'; rc=1; fi
+
     if command -v curl >/dev/null 2>&1 && [[ -r "$BASE_CONFIG" ]]; then
         hurl="$(healthz_url)"; health="$(curl -fsS --max-time 2 "$hurl" 2>/dev/null || true)"
         printf 'kubelet healthz      : %s (%s)\n' "${health:-unreachable}" "$hurl"; [[ "$health" == "ok" ]] || rc=1
     else printf 'kubelet healthz      : skipped/unavailable\n'; fi
-    if command -v kubectl >/dev/null 2>&1 && node="$(resolve_node_name 2>/dev/null)"; then
-        ready="$(kubectl get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+    if kubernetes_api_available && node="$(resolve_node_name 2>/dev/null)"; then
+        ready="$(kubectl get node "$node" --request-timeout=5s -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
         printf 'node                 : %s\nnode Ready           : %s\n' "$node" "${ready:-unknown}"; [[ "$ready" == "True" ]] || rc=1
-    else printf 'node Ready           : skipped/unavailable\n'; fi
+    else printf 'node Ready           : skipped (Kubernetes API unavailable/unresolved)\n'; fi
     latest="$(latest_backup_dir)"; printf 'latest backup        : %s\n' "${latest:-none}"
     local count=0
     if [[ -d "$BACKUP_ROOT" ]]; then
         count="$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec test -f '{}/metadata.env' ';' -print 2>/dev/null | wc -l | tr -d ' ')"
     fi
     printf 'snapshot retention   : %s\nvalid snapshots      : %s\n' "$SNAPSHOT_RETENTION_COUNT" "$count"
+    cleanup_profile_workdir
     return "$rc"
 }
 
@@ -751,6 +1087,7 @@ on_error() {
         error "APPLY 失败，触发自动 rollback"
         rollback_current_after_failure || error "自动 rollback 失败，请立即人工处理"
     fi
+    cleanup_profile_workdir
     exit "$rc"
 }
 trap 'on_error "$LINENO" "$BASH_COMMAND" "$?"' ERR

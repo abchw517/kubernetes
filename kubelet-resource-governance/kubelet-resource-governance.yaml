@@ -1,3 +1,4 @@
+# kubelet-resource-governance v2.4.3
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 
@@ -32,6 +33,8 @@ enforceNodeAllocatable:
   - pods
 
 # Node Pressure Eviction
+# Memory Profile 仅动态覆盖 evictionSoft/evictionHard 的 memory.available。
+# <=16GiB 节点使用本模板默认值：Soft=1Gi / Hard=500Mi。
 mergeDefaultEvictionSettings: true
 
 evictionSoft:
