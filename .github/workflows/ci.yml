@@ -1,0 +1,81 @@
+name: Repository CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Shell, Python and YAML checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck yamllint
+
+      - name: Validate Bash syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            echo "bash -n: ${file}"
+            bash -n "${file}"
+          done < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(
+            find . -type f -name '*.sh' -not -path './.git/*' -print0
+          )
+          if (( ${#files[@]} == 0 )); then
+            echo "No Shell scripts found."
+            exit 0
+          fi
+          shellcheck --severity=error "${files[@]}"
+
+      - name: Compile-check Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(
+            find . -type f -name '*.py' -not -path './.git/*' -print0
+          )
+          if (( ${#files[@]} == 0 )); then
+            echo "No Python files found."
+            exit 0
+          fi
+          python3 -m py_compile "${files[@]}"
+
+      - name: Lint YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(
+            find . -type f \( -name '*.yaml' -o -name '*.yml' \)               -not -path './.git/*' -print0
+          )
+          if (( ${#files[@]} == 0 )); then
+            echo "No YAML files found."
+            exit 0
+          fi
+
+          yamllint             --config-data '{extends: default, rules: {document-start: disable, line-length: disable, truthy: {check-keys: false}}}'             "${files[@]}"
