@@ -11,6 +11,7 @@
 | [k8s-gray-scale-zero](./k8s-gray-scale-zero) | 灰度 Deployment 副本批量安全置零：校验正式 Deployment 健康 / 无 HPA 干预后分批缩容，支持观察窗口与回退 |
 | [namespace-terminating-diagnose](./namespace-terminating-diagnose) | Namespace 长时间 `Terminating` 生产级只读诊断工具；详细版本、CLI、RBAC、CI、JSON、Prometheus 与测试说明见子项目 README |
 | [resource-terminating-diagnose](./resource-terminating-diagnose) | Pod / PVC / PV / VolumeAttachment `Terminating` 专项只读诊断：自动关联 Pod→PVC→PV→VolumeAttachment→Node，支持 JSON、全局扫描、只读 RBAC 与 PrometheusRule |
+| [pod-start-time-check](./pod-start-time-check) | Deployment Pod 启动耗时巡检：全局/单 Namespace 扫描、慢启动分级、HTML/企业微信报告、最小只读 RBAC 与 kubectl 双层 Timeout |
 
 ## 工具设计原则
 
