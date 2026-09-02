@@ -1,0 +1,106 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubernetes-resource-terminating
+  namespace: cattle-prometheus
+spec:
+  groups:
+    - name: kubernetes.resource-terminating.ksm
+      rules:
+        - alert: KubernetesPodStuckTerminating
+          expr: (time() - kube_pod_deletion_timestamp) > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod stuck in Terminating"
+            description: >-
+              Pod {{ $labels.namespace }}/{{ $labels.pod }} has been deleting
+              for more than 10 minutes. Run resource-terminating-diagnose before
+              any force deletion.
+
+        - alert: KubernetesPVCStuckTerminating
+          expr: (time() - kube_persistentvolumeclaim_deletion_timestamp) > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "PVC stuck in Terminating"
+            description: >-
+              PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }}
+              has been deleting for more than 10 minutes. Check consuming Pods,
+              PV, VolumeAttachment and CSI state before touching finalizers.
+
+        - alert: KubernetesPVStuckTerminating
+          expr: (time() - kube_persistentvolume_deletion_timestamp) > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "PV stuck in Terminating"
+            description: >-
+              PV {{ $labels.persistentvolume }} has been deleting for more than
+              10 minutes. Verify reclaimPolicy, CSI finalizers and backend volume
+              state before any break-glass cleanup.
+
+    - name: kubernetes.resource-terminating.collector
+      rules:
+        - alert: ResourceTerminatingCollectorMissing
+          expr: absent(resource_terminating_diagnose_generated_timestamp_seconds)
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Resource Terminating collector metrics are missing"
+            description: >-
+              The v1.1 collector metrics are not visible to Prometheus. Check
+              collector scheduling and the textfile/exporter scrape path.
+
+        - alert: ResourceTerminatingCollectorStale
+          expr: time() - resource_terminating_diagnose_generated_timestamp_seconds > 180
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Resource Terminating collector is stale"
+            description: >-
+              The collector has not refreshed its metrics for more than three
+              minutes.
+
+        - alert: ResourceTerminatingCollectorScanFailed
+          expr: resource_terminating_diagnose_scan_success == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Resource Terminating collector scan is incomplete"
+            description: >-
+              At least one Kubernetes API query failed. Results must be treated
+              fail-closed; check RBAC, API availability and collector logs.
+
+        - alert: KubernetesTerminatingObjectsOverThreshold
+          expr: resource_terminating_diagnose_over_threshold_objects > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kubernetes {{ $labels.kind }} objects exceed Terminating threshold"
+            description: >-
+              One or more {{ $labels.kind }} objects have remained in deletion
+              longer than the collector threshold.
+
+        - alert: KubernetesVolumeAttachmentStuckTerminating
+          expr: |
+            resource_terminating_diagnose_object_deletion_age_seconds{kind="volumeattachment"} > 600
+            and on(name)
+            resource_terminating_diagnose_volumeattachment_attached == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Deleting VolumeAttachment is still attached"
+            description: >-
+              VolumeAttachment {{ $labels.name }} has been deleting for more
+              than 10 minutes while status.attached remains true. Verify Node
+              fencing and the real storage-provider attachment before any force
+              detach or finalizer removal.
