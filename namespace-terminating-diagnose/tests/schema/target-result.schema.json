@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/namespace-terminating-diagnose/target-result.schema.json",
+  "title": "namespace-terminating-diagnose target result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "tool",
+    "version",
+    "command",
+    "generated_at",
+    "namespace",
+    "threshold_seconds",
+    "verdict",
+    "verdict_reason",
+    "exit_code",
+    "force_finalize_ready",
+    "counts",
+    "warnings",
+    "dangers",
+    "force_blockers",
+    "remaining_resources",
+    "finalizer_objects",
+    "unavailable_apiservices"
+  ],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "tool": {"const": "namespace-terminating-diagnose"},
+    "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "command": {"enum": ["check", "diagnose", "report", "force-check"]},
+    "generated_at": {"type": "string"},
+    "namespace": {
+      "type": "object",
+      "required": ["name", "phase", "deletion_timestamp", "terminating_age_seconds", "spec_finalizers"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "phase": {"type": "string"},
+        "deletion_timestamp": {"type": ["string", "null"]},
+        "terminating_age_seconds": {"type": "integer", "minimum": -1},
+        "spec_finalizers": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "threshold_seconds": {"type": "integer", "minimum": 0},
+    "verdict": {"enum": ["SAFE", "WARNING", "DANGEROUS", "FORCE-FINALIZE-READY"]},
+    "verdict_reason": {"type": "string"},
+    "exit_code": {"enum": [0, 10, 20, 30]},
+    "force_finalize_ready": {"type": "boolean"},
+    "counts": {
+      "type": "object",
+      "required": [
+        "remaining_objects",
+        "terminating_objects",
+        "objects_with_finalizers",
+        "custom_resources",
+        "pvc",
+        "related_pv",
+        "volume_attachments",
+        "scan_errors",
+        "warnings",
+        "dangers",
+        "force_blockers"
+      ],
+      "properties": {
+        "remaining_objects": {"type": "integer", "minimum": 0},
+        "terminating_objects": {"type": "integer", "minimum": 0},
+        "objects_with_finalizers": {"type": "integer", "minimum": 0},
+        "custom_resources": {"type": "integer", "minimum": 0},
+        "pvc": {"type": "integer", "minimum": 0},
+        "related_pv": {"type": "integer", "minimum": 0},
+        "volume_attachments": {"type": "integer", "minimum": 0},
+        "scan_errors": {"type": "integer", "minimum": 0},
+        "warnings": {"type": "integer", "minimum": 0},
+        "dangers": {"type": "integer", "minimum": 0},
+        "force_blockers": {"type": "integer", "minimum": 0}
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "dangers": {"type": "array", "items": {"type": "string"}},
+    "force_blockers": {"type": "array", "items": {"type": "string"}},
+    "remaining_resources": {"type": "array"},
+    "finalizer_objects": {"type": "array"},
+    "unavailable_apiservices": {"type": "array"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"verdict": {"const": "FORCE-FINALIZE-READY"}}},
+      "then": {
+        "properties": {
+          "command": {"const": "force-check"},
+          "exit_code": {"const": 30},
+          "force_finalize_ready": {"const": true}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"command": {"const": "check"}}},
+      "then": {"properties": {"force_finalize_ready": {"const": false}}}
+    }
+  ]
+}
