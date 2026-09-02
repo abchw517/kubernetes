@@ -208,6 +208,8 @@ validate_config() {
         fatal "--request-timeout 禁止为 0: ${KUBECTL_REQUEST_TIMEOUT}"
     is_zero_duration "${KUBECTL_COMMAND_TIMEOUT}" && \
         fatal "--command-timeout 禁止为 0: ${KUBECTL_COMMAND_TIMEOUT}"
+
+    return 0
 }
 
 require_cmd() {
