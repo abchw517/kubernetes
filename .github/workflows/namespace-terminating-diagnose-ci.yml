@@ -10,9 +10,6 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'namespace-terminating-diagnose/**'
-      - '.github/workflows/namespace-terminating-diagnose-ci.yml'
   workflow_dispatch:
 
 permissions:
