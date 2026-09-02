@@ -1,0 +1,55 @@
+# namespace-terminating-diagnose v2.1.0
+#
+# Full diagnostic mode needs to enumerate arbitrary namespaced resources and CRs.
+# Kubernetes RBAC cannot grant wildcard metadata-only access, so this ClusterRole
+# intentionally grants broad READ-ONLY get/list access. It has zero write verbs.
+#
+# Security note:
+#   get/list on all resources may expose Secret data to this ServiceAccount.
+#   Protect its token/kubeconfig and bind it only where full diagnosis is required.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: namespace-terminating-diagnose
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: namespace-terminating-diagnose
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: namespace-terminating-diagnose-readonly
+  labels:
+    app.kubernetes.io/name: namespace-terminating-diagnose
+rules:
+  - apiGroups:
+      - "*"
+    resources:
+      - "*"
+    verbs:
+      - get
+      - list
+  - nonResourceURLs:
+      - /version
+      - /api
+      - /api/*
+      - /apis
+      - /apis/*
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: namespace-terminating-diagnose-readonly
+  labels:
+    app.kubernetes.io/name: namespace-terminating-diagnose
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: namespace-terminating-diagnose-readonly
+subjects:
+  - kind: ServiceAccount
+    name: namespace-terminating-diagnose
+    namespace: kube-system
