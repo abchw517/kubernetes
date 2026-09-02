@@ -42,6 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           bash -n pod-start-time-check/pod-start-time-check.sh
+          bash -n pod-start-time-check/provision-kubeconfig.sh
           bash -n pod-start-time-check/tests/run-tests.sh
           bash -n pod-start-time-check/tests/mock-kubectl
 
@@ -51,6 +52,7 @@ jobs:
           set -euo pipefail
           shellcheck --severity=error \
             pod-start-time-check/pod-start-time-check.sh \
+            pod-start-time-check/provision-kubeconfig.sh \
             pod-start-time-check/tests/run-tests.sh \
             pod-start-time-check/tests/mock-kubectl
 
@@ -91,7 +93,7 @@ jobs:
           print('RBAC exact baseline: OK')
           PY
 
-      - name: Run contract tests
+      - name: Run identity contract tests
         shell: bash
         run: |
           set -euo pipefail
