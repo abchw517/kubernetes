@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/namespace-terminating-diagnose/patrol-result.schema.json",
+  "title": "namespace-terminating-diagnose patrol result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "tool",
+    "version",
+    "command",
+    "mode",
+    "generated_at",
+    "threshold_seconds",
+    "verdict",
+    "verdict_reason",
+    "exit_code",
+    "counts",
+    "warnings",
+    "namespaces"
+  ],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "tool": {"const": "namespace-terminating-diagnose"},
+    "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "command": {"const": "check"},
+    "mode": {"const": "all-terminating"},
+    "generated_at": {"type": "string"},
+    "threshold_seconds": {"type": "integer", "minimum": 0},
+    "verdict": {"enum": ["SAFE", "WARNING"]},
+    "verdict_reason": {"type": "string"},
+    "exit_code": {"enum": [0, 10]},
+    "counts": {
+      "type": "object",
+      "required": ["terminating", "over_threshold", "unknown_age"],
+      "properties": {
+        "terminating": {"type": "integer", "minimum": 0},
+        "over_threshold": {"type": "integer", "minimum": 0},
+        "unknown_age": {"type": "integer", "minimum": 0}
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "namespaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["namespace", "phase", "deletion_timestamp", "age_seconds", "over_threshold"],
+        "properties": {
+          "namespace": {"type": "string", "minLength": 1},
+          "phase": {"type": "string"},
+          "deletion_timestamp": {"type": "string"},
+          "age_seconds": {"type": "integer", "minimum": -1},
+          "over_threshold": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}
