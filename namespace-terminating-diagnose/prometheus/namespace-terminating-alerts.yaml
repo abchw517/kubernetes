@@ -1,0 +1,43 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: namespace-terminating-diagnose
+  labels:
+    app.kubernetes.io/name: namespace-terminating-diagnose
+spec:
+  groups:
+    - name: namespace-terminating-diagnose.rules
+      rules:
+        - alert: NamespaceTerminatingOverThreshold
+          expr: namespace_terminating_diagnose_namespace_over_threshold == 1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Namespace {{ $labels.namespace }} 长时间处于 Terminating"
+            description: >-
+              Namespace {{ $labels.namespace }} 已超过 namespace-terminating-diagnose
+              巡检阈值。默认阈值为 600 秒，请运行 diagnose 子命令定位
+              APIService、Finalizer、PVC/PV/VolumeAttachment、CR、Webhook/VAP 等阻塞点。
+
+        - alert: NamespaceTerminatingPatrolStale
+          expr: absent(namespace_terminating_diagnose_generated_timestamp_seconds{mode="patrol"}) or (time() - namespace_terminating_diagnose_generated_timestamp_seconds{mode="patrol"} > 900)
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Namespace Terminating 巡检指标超过 15 分钟未更新"
+            description: >-
+              namespace-terminating-diagnose patrol 指标缺失或已超过 15 分钟没有刷新。
+              请检查 Cron/Jenkins/Node Exporter textfile collector 执行链路。
+
+        - alert: NamespaceTerminatingPatrolUnknownAge
+          expr: namespace_terminating_diagnose_patrol_unknown_age_total > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "存在无法解析删除时长的 Terminating Namespace"
+            description: >-
+              巡检发现至少一个 Namespace 的 deletionTimestamp 无法解析。
+              该场景会阻止 FORCE-FINALIZE-READY 判定，请检查节点时间、时间格式和执行环境。
