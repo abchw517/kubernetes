@@ -9,7 +9,36 @@
 | [kubelet-resource-governance](./kubelet-resource-governance) | Kubelet 参数调优工具：以 drop-in 方式管理资源、驱逐、Image GC、容器日志等参数，支持 check / diff / apply / rollback，写前快照、失败回滚 |
 | [pod-migrate](./pod-migrate) | Pod 平滑迁移工具（Shell / Python 双版本）：不改副本数、不整节点 drain，将指定节点上的 Deployment Pod 平滑迁到其他节点 |
 | [k8s-gray-scale-zero](./k8s-gray-scale-zero) | 灰度 Deployment 副本批量安全置零：校验正式 Deployment 健康 / 无 HPA 干预后分批缩容，支持观察窗口与回退 |
-| [namespace-terminating-diagnose](./namespace-terminating-diagnose) | Namespace 长时间 `Terminating` 生产级只读诊断工具；详细版本、CLI、RBAC、CI、JSON、Prometheus 与测试说明见子项目 README |
+| [namespace-terminating-diagnose](./namespace-terminating-diagnose) | Kubernetes Terminating 专项治理套件：Namespace + Pod / PVC / PV / VolumeAttachment 生产级只读诊断，支持 `check / diagnose / report / force-check`、自动资源链关联、JSON、Prometheus、RBAC、CI 与 Break-Glass fail-closed 门禁 |
+
+## Terminating 专项治理
+
+统一入口：
+
+```bash
+./namespace-terminating-diagnose/terminating-diagnose.sh \
+  diagnose pod \
+  -n <namespace> \
+  --name <pod>
+```
+
+支持诊断目标：
+
+```text
+namespace
+pod
+pvc
+pv
+volumeattachment
+```
+
+资源链诊断遵循：
+
+```text
+Pod -> PVC -> PV -> VolumeAttachment -> Node / CSI / Storage Backend
+```
+
+工具本身严格只读，不自动执行 `delete`、`patch`、Finalizer 清理或 VolumeAttachment 强制删除。
 
 ## 工具设计原则
 
@@ -21,6 +50,6 @@
 ## 环境约定
 
 - Kubernetes v1.34+，kubeadm 部署
-- 脚本均面向生产运维场景设计，执行前请先阅读各工具目录内的 README
+- 脚本均面向生产运维场景设计，执行前请先阅读各工具目录内的 README / docs
 - 涉及节点、工作负载或资源删除的变更操作，先在测试集群演练
 - 只读诊断工具同样需要遵循 Kubernetes RBAC 最小权限与凭据隔离原则
