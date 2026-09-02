@@ -85,7 +85,7 @@ spec:
                 kube_node_status_condition{
                   condition="Ready",
                   status="true"
-                } == 0
+                } == bool 0
               )
             > 0
           for: 10m
