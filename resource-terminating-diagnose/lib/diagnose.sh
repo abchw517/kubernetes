@@ -141,6 +141,21 @@ force_check_graph() {
   [[ $(jq '(.nodes // []) | any(.ready!="True")' <<<"$graph") == "true" ]] && add_blocker "RELATED_NODE_NOT_READY_OR_UNKNOWN_FENCING_REQUIRED"
   [[ $(jq '(.pods // []) | any(.deletionTimestamp==null)' <<<"$graph") == "true" ]] && add_blocker "PVC_OR_PV_STILL_CONSUMED_BY_LIVE_POD"
 
+  # Finalizer allowlists are deliberately narrow. Unknown/custom finalizers normally
+  # represent controller-owned cleanup that this read-only tool cannot prove complete.
+  # Such objects must remain BLOCKED until the owning controller/cleanup contract is
+  # identified and reviewed.
+  if [[ "$kind" == "PersistentVolumeClaim" ]]; then
+    [[ $(jq '(.target.finalizers // []) | any(. != "kubernetes.io/pvc-protection")' <<<"$graph") == "true" ]] && \
+      add_blocker "UNKNOWN_OR_CUSTOM_FINALIZER_REQUIRES_CONTROLLER_REVIEW"
+  elif [[ "$kind" == "PersistentVolume" ]]; then
+    [[ $(jq '(.target.finalizers // []) | any(. != "kubernetes.io/pv-protection" and (test("external-provisioner|external-attacher")|not))' <<<"$graph") == "true" ]] && \
+      add_blocker "UNKNOWN_OR_CUSTOM_FINALIZER_REQUIRES_CONTROLLER_REVIEW"
+  elif [[ "$kind" == "VolumeAttachment" ]]; then
+    [[ $(jq '(.target.finalizers // []) | any((test("^external-attacher/")|not))' <<<"$graph") == "true" ]] && \
+      add_blocker "UNKNOWN_OR_CUSTOM_FINALIZER_REQUIRES_CONTROLLER_REVIEW"
+  fi
+
   if [[ $(jq '(.csi // [])|length > 0' <<<"$graph") == "true" ]]; then
     [[ $(jq '(.csi // []) | any(.discovery.componentPodsFound == 0)' <<<"$graph") == "true" ]] && add_blocker "CSI_COMPONENT_DISCOVERY_INCOMPLETE"
     [[ $(jq '(.csi // []) | any(any(.componentPods[]?; (.ready != true or .deleting == true)))' <<<"$graph") == "true" ]] && add_blocker "CSI_COMPONENT_UNHEALTHY_OR_DELETING"
@@ -192,4 +207,3 @@ force_check_graph() {
       }
     }'
 }
-
