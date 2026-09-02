@@ -2,7 +2,7 @@
 # ==============================================================================
 # pod-start-time-check.sh
 # Kubernetes Pod Scheduled -> current Ready transition duration checker
-# v2.2.0 Production Hardening
+# v2.2.1 Production Maintenance
 #
 # Metric semantics:
 #   Ready=True condition.lastTransitionTime - PodScheduled.lastTransitionTime
@@ -18,7 +18,7 @@ umask 077
 IFS=$'\n\t'
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.2.1"
 readonly METRIC_NAME="scheduled_to_current_ready_transition_seconds"
 
 NAMESPACE=""
@@ -29,9 +29,11 @@ KUBECTL_REQUEST_TIMEOUT="${KUBECTL_REQUEST_TIMEOUT:-30s}"
 KUBECTL_COMMAND_TIMEOUT="${KUBECTL_COMMAND_TIMEOUT:-45s}"
 
 LOG_DIR="${LOG_DIR:-/data/logs/pod-start-time-check}"
-REPORT_DIR="${REPORT_DIR:-${LOG_DIR}/reports}"
+REPORT_DIR="${REPORT_DIR:-}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/pod-start-time-check/pod-start-time-check.lock}"
 WECHAT_WEBHOOK_URL="${WECHAT_WEBHOOK_URL:-}"
+REPORT_DIR_EXPLICIT=false
+[[ -n "${REPORT_DIR}" ]] && REPORT_DIR_EXPLICIT=true
 
 LOG_FILE=""
 TMP_DIR=""
@@ -64,12 +66,15 @@ Options:
       --critical-seconds <s> 红色告警阈值，默认 180
       --request-timeout <t>  Kubernetes API 单次请求超时，默认 30s；禁止 0
       --command-timeout <t>  kubectl 整体命令超时，默认 45s；禁止 0
-      --webhook-url <url>    企业微信群机器人 Webhook；生产建议使用 WECHAT_WEBHOOK_URL
       --log-dir <dir>        日志目录，默认 /data/logs/pod-start-time-check
       --report-dir <dir>     HTML 报告目录，默认 <log-dir>/reports
       --lock-file <path>     锁文件，默认 /run/lock/pod-start-time-check/pod-start-time-check.lock
   -h, --help                 显示帮助
   -v, --version              显示版本
+
+WeCom:
+  仅通过环境变量 WECHAT_WEBHOOK_URL 配置机器人 Webhook，避免 Secret 暴露在
+  shell history 和进程参数中。
 
 Metric:
   scheduled_to_current_ready_transition_seconds =
@@ -151,10 +156,7 @@ parse_args() {
                 shift 2
                 ;;
             --webhook-url)
-                (($# >= 2)) || fatal "$1 缺少 URL 参数"
-                WECHAT_WEBHOOK_URL="$2"
-                log "WARN" "--webhook-url 可能暴露在 shell history/进程参数中，生产建议使用 WECHAT_WEBHOOK_URL"
-                shift 2
+                fatal "--webhook-url 已移除；请通过 WECHAT_WEBHOOK_URL 环境变量配置，避免 Secret 暴露在命令行"
                 ;;
             --log-dir)
                 (($# >= 2)) || fatal "$1 缺少目录参数"
@@ -164,6 +166,7 @@ parse_args() {
             --report-dir)
                 (($# >= 2)) || fatal "$1 缺少目录参数"
                 REPORT_DIR="$2"
+                REPORT_DIR_EXPLICIT=true
                 shift 2
                 ;;
             --lock-file)
@@ -184,6 +187,12 @@ parse_args() {
                 ;;
         esac
     done
+}
+
+finalize_paths() {
+    if [[ "${REPORT_DIR_EXPLICIT}" == false ]]; then
+        REPORT_DIR="${LOG_DIR}/reports"
+    fi
 }
 
 validate_config() {
@@ -257,9 +266,7 @@ validate_lock_path() {
     lock_dir="${LOCK_FILE%/*}"
     [[ "${lock_dir}" != "${LOCK_FILE}" ]] || lock_dir="."
 
-    if [[ -L "${lock_dir}" ]]; then
-        fatal "锁目录不能是符号链接: ${lock_dir}"
-    fi
+    [[ ! -L "${lock_dir}" ]] || fatal "锁目录不能是符号链接: ${lock_dir}"
 
     if [[ ! -d "${lock_dir}" ]]; then
         mkdir -p -m 0700 "${lock_dir}" || fatal "无法创建安全锁目录: ${lock_dir}"
@@ -351,21 +358,16 @@ forbid_rbac_permission() {
 }
 
 check_rbac_permissions() {
-    local -a auth_scope=()
+    local -a scope_args=(-A)
+    [[ -n "${NAMESPACE}" ]] && scope_args=(-n "${NAMESPACE}")
 
-    if [[ -n "${NAMESPACE}" ]]; then
-        auth_scope=(-n "${NAMESPACE}")
-    else
-        auth_scope=(--all-namespaces)
-    fi
+    require_rbac_permission "pods:list" list pods "${scope_args[@]}"
+    require_rbac_permission "replicasets.apps:list" list replicasets.apps "${scope_args[@]}"
 
-    require_rbac_permission "pods:list" list pods "${auth_scope[@]}"
-    require_rbac_permission "replicasets.apps:list" list replicasets.apps "${auth_scope[@]}"
-
-    forbid_rbac_permission "wildcard */*" '*' '*' "${auth_scope[@]}"
-    forbid_rbac_permission "secrets:get" get secrets "${auth_scope[@]}"
-    forbid_rbac_permission "pods:delete" delete pods "${auth_scope[@]}"
-    forbid_rbac_permission "deployments.apps:patch" patch deployments.apps "${auth_scope[@]}"
+    forbid_rbac_permission "wildcard */*" '*' '*' "${scope_args[@]}"
+    forbid_rbac_permission "secrets:get" get secrets "${scope_args[@]}"
+    forbid_rbac_permission "pods:delete" delete pods "${scope_args[@]}"
+    forbid_rbac_permission "deployments.apps:patch" patch deployments.apps "${scope_args[@]}"
     forbid_rbac_permission \
         "clusterrolebindings.rbac.authorization.k8s.io:create" \
         create clusterrolebindings.rbac.authorization.k8s.io
@@ -378,22 +380,11 @@ preflight() {
     log "INFO" "预检查通过: request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}"
 }
 
-kubectl_scope_args() {
-    if [[ -n "${NAMESPACE}" ]]; then
-        printf '%s\0' '-n' "${NAMESPACE}"
-    else
-        printf '%s\0' '-A'
-    fi
-}
-
 fetch_cluster_data() {
-    local -a scope_args=()
+    local -a scope_args=(-A)
     local pod_json="${TMP_DIR}/pods.json"
     local rs_json="${TMP_DIR}/replicasets.json"
-
-    while IFS= read -r -d '' arg; do
-        scope_args+=("${arg}")
-    done < <(kubectl_scope_args)
+    [[ -n "${NAMESPACE}" ]] && scope_args=(-n "${NAMESPACE}")
 
     log "INFO" "开始拉取 Pod 与 ReplicaSet 数据，范围: ${NAMESPACE:-ALL_NAMESPACES}"
 
@@ -412,18 +403,6 @@ fetch_cluster_data() {
 
 build_deployment_map() {
     local rs_json="${TMP_DIR}/replicasets.json"
-    local map_file="${TMP_DIR}/rs-deployment.tsv"
-
-    jq -r '
-      .items[]
-      | .metadata.namespace as $ns
-      | .metadata.name as $rs
-      | ((.metadata.ownerReferences // [])
-          | map(select(.kind == "Deployment" and (.controller // false) == true))
-          | .[0].name // "-") as $deploy
-      | [$ns, $rs, $deploy]
-      | @tsv
-    ' "${rs_json}" > "${map_file}"
 
     declare -gA RS_TO_DEPLOYMENT=()
 
@@ -431,49 +410,22 @@ build_deployment_map() {
     while IFS=$'\t' read -r ns rs deployment; do
         [[ -n "${ns}" && -n "${rs}" ]] || continue
         RS_TO_DEPLOYMENT["${ns}/${rs}"]="${deployment}"
-    done < "${map_file}"
+    done < <(
+        jq -r '
+          .items[]
+          | .metadata.namespace as $ns
+          | .metadata.name as $rs
+          | ((.metadata.ownerReferences // [])
+              | map(select(.kind == "Deployment" and (.controller // false) == true))
+              | .[0].name // "-") as $deploy
+          | [$ns, $rs, $deploy]
+          | @tsv
+        ' "${rs_json}"
+    )
 }
 
 extract_pod_records() {
     local pod_json="${TMP_DIR}/pods.json"
-    local pods_tsv="${TMP_DIR}/pods.tsv"
-
-    jq -r '
-      def epoch_or_null:
-        if . == "" or . == null then null
-        else try fromdateiso8601 catch null
-        end;
-
-      .items[]
-      | .metadata.namespace as $ns
-      | .metadata.name as $pod
-      | ((.metadata.ownerReferences // [])
-          | map(select((.controller // false) == true))
-          | .[0]) as $owner
-      | ((.status.conditions // [])
-          | map(select(.type == "PodScheduled"))
-          | .[0].lastTransitionTime // "") as $scheduled
-      | ((.status.conditions // [])
-          | map(select(.type == "Ready" and .status == "True"))
-          | .[0].lastTransitionTime // "") as $ready
-      | ($scheduled | epoch_or_null) as $scheduled_epoch
-      | ($ready | epoch_or_null) as $ready_epoch
-      | (if ($scheduled_epoch != null and $ready_epoch != null)
-           then ($ready_epoch - $scheduled_epoch)
-           else null
-         end) as $duration
-      | [
-          $ns,
-          $pod,
-          ($owner.kind // ""),
-          ($owner.name // ""),
-          $scheduled,
-          $ready,
-          (if $duration == null then "" else ($duration | tostring) end)
-        ]
-      | @tsv
-    ' "${pod_json}" > "${pods_tsv}"
-
     local ns pod owner_kind owner_name scheduled ready duration deployment
 
     while IFS=$'\t' read -r ns pod owner_kind owner_name scheduled ready duration; do
@@ -485,8 +437,6 @@ extract_pod_records() {
                 ;;
             Deployment)
                 deployment="${owner_name}"
-                ;;
-            *)
                 ;;
         esac
 
@@ -510,10 +460,45 @@ extract_pod_records() {
 
         printf '%s\t%s\t%s\t%d\n' \
             "${ns}" "${deployment}" "${pod}" "${duration}" >> "${RESULT_TSV}"
-    done < "${pods_tsv}"
+    done < <(
+        jq -r '
+          def epoch_or_null:
+            if . == "" or . == null then null
+            else try fromdateiso8601 catch null
+            end;
+
+          .items[]
+          | .metadata.namespace as $ns
+          | .metadata.name as $pod
+          | ((.metadata.ownerReferences // [])
+              | map(select((.controller // false) == true))
+              | .[0]) as $owner
+          | ((.status.conditions // [])
+              | map(select(.type == "PodScheduled"))
+              | .[0].lastTransitionTime // "") as $scheduled
+          | ((.status.conditions // [])
+              | map(select(.type == "Ready" and .status == "True"))
+              | .[0].lastTransitionTime // "") as $ready
+          | ($scheduled | epoch_or_null) as $scheduled_epoch
+          | ($ready | epoch_or_null) as $ready_epoch
+          | (if ($scheduled_epoch != null and $ready_epoch != null)
+               then ($ready_epoch - $scheduled_epoch)
+               else null
+             end) as $duration
+          | [
+              $ns,
+              $pod,
+              ($owner.kind // ""),
+              ($owner.name // ""),
+              $scheduled,
+              $ready,
+              (if $duration == null then "" else ($duration | tostring) end)
+            ]
+          | @tsv
+        ' "${pod_json}"
+    )
 
     sort -t $'\t' -k4,4nr -k1,1 -k2,2 -k3,3 "${RESULT_TSV}" -o "${RESULT_TSV}"
-
     awk -F '\t' -v warn="${WARN_SECONDS}" '$4 > warn' "${RESULT_TSV}" > "${SLOW_TSV}"
 
     WARN_COUNT="$(awk -F '\t' -v warn="${WARN_SECONDS}" -v critical="${CRITICAL_SECONDS}" \
@@ -643,7 +628,7 @@ EOF_HTML
     cat >> "${REPORT_FILE}" <<'EOF_HTML'
 </tbody>
 </table>
-<div class="footer">Generated by pod-start-time-check.sh v2.2.0</div>
+<div class="footer">Generated by pod-start-time-check.sh v2.2.1</div>
 </body>
 </html>
 EOF_HTML
@@ -772,6 +757,7 @@ send_wechat_report() {
 
 main() {
     parse_args "$@"
+    finalize_paths
     validate_config
     bootstrap_preflight
     init_runtime

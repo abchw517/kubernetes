@@ -84,8 +84,40 @@ grep -q 'dep&lt;&amp;&quot;' "$report"
 grep -q 'scheduled_to_current_ready_transition_seconds' "$report"
 grep -q '当前 Ready transition 的代理耗时' "$report"
 
-# 6. Static regression: there must be no per-Pod date -d conversion.
+# 6. P2: --log-dir must re-derive default REPORT_DIR after CLI parsing.
+dir="${TMP}/derived-report"
+mkdir -p "${dir}/lock"
+LOG_DIR= REPORT_DIR= LOCK_FILE="${dir}/lock/tool.lock" \
+  bash "$TOOL" --log-dir "${dir}/custom-logs" >"${dir}/stdout" 2>"${dir}/stderr"
+report=$(find "${dir}/custom-logs/reports" -type f -name '*.html' -print -quit)
+[[ -n "$report" ]]
+
+# Explicit REPORT_DIR must still win over --log-dir.
+dir="${TMP}/explicit-report"
+mkdir -p "${dir}/lock" "${dir}/explicit-reports"
+LOG_DIR= REPORT_DIR="${dir}/explicit-reports" LOCK_FILE="${dir}/lock/tool.lock" \
+  bash "$TOOL" --log-dir "${dir}/custom-logs" >"${dir}/stdout" 2>"${dir}/stderr"
+report=$(find "${dir}/explicit-reports" -type f -name '*.html' -print -quit)
+[[ -n "$report" ]]
+[[ ! -d "${dir}/custom-logs/reports" ]]
+
+# 7. P2: Webhook secret must not be accepted via command-line argument.
+set +e
+run_tool webhook-arg --dry-run --webhook-url 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=SECRET'
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]]
+grep -q -- '--webhook-url 已移除' "${TMP}/webhook-arg/stderr"
+! bash "$TOOL" --help | grep -q -- '--webhook-url <url>'
+
+# 8. Static regressions: no per-Pod date process and no redundant intermediate TSV helpers.
 ! grep -q 'date -d' "$TOOL"
 grep -q 'fromdateiso8601' "$TOOL"
+! grep -q 'kubectl_scope_args' "$TOOL"
+! grep -q 'rs-deployment.tsv' "$TOOL"
+! grep -q 'pods.tsv' "$TOOL"
 
-printf 'pod-start-time-check v2.2.0 contract tests: OK\n'
+# 9. Version marker.
+bash "$TOOL" --version | grep -q '2.2.1'
+
+printf 'pod-start-time-check v2.2.1 contract tests: OK\n'
