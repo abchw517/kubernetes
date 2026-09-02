@@ -1,0 +1,112 @@
+name: Namespace Terminating Diagnose Gate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'namespace-terminating-diagnose/**'
+      - '.github/workflows/namespace-terminating-diagnose-ci.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'namespace-terminating-diagnose/**'
+      - '.github/workflows/namespace-terminating-diagnose-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: namespace-terminating-diagnose-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-quality:
+    name: Bash syntax and ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+
+      - name: Validate Bash syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            echo "bash -n: ${file}"
+            bash -n "${file}"
+          done < <(
+            find namespace-terminating-diagnose \
+              -type f \
+              \( -name '*.sh' -o -path '*/tests/mock/bin/kubectl' \) \
+              -print0
+          )
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(
+            find namespace-terminating-diagnose \
+              -type f \
+              \( -name '*.sh' -o -path '*/tests/mock/bin/kubectl' \) \
+              -print0
+          )
+          shellcheck --severity=error "${files[@]}"
+
+      - name: Enforce read-only Shell contract
+        shell: bash
+        run: |
+          bash namespace-terminating-diagnose/tests/validate-readonly.sh
+
+  contract-tests:
+    name: JSON, mock E2E and exit-code contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install contract test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq python3-pip
+          python3 -m pip install --disable-pip-version-check \
+            jsonschema \
+            PyYAML
+
+      - name: Validate read-only RBAC
+        run: |
+          python3 namespace-terminating-diagnose/tests/validate-rbac.py \
+            namespace-terminating-diagnose/rbac/namespace-terminating-diagnose-readonly.yaml
+
+      - name: Run mock Kubernetes contract suite
+        shell: bash
+        run: |
+          bash namespace-terminating-diagnose/tests/run-tests.sh
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
