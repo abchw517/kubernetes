@@ -1,73 +1,127 @@
 # namespace-terminating-diagnose
 
-Kubernetes Namespace `Terminating` 状态生产级只读诊断工具。
+Kubernetes Namespace `Terminating` 状态生产级只读诊断 CLI。
 
-`namespace-terminating-diagnose.sh` 用于定位 Namespace 长时间无法删除的真实阻塞点，自动检查 Namespace Conditions、APIService、全部 namespaced resources、Finalizer、Pod、PVC/PV/VolumeAttachment、Custom Resource、Admission Webhook 与 ValidatingAdmissionPolicy，并最终输出统一风险判定。
+当前版本：**v2.0.0**。
 
-当前版本：**v1.0.0**。
+`namespace-terminating-diagnose` 用于定位 Namespace 长时间无法删除的真实阻塞点，并把结果统一输出给 **人工运维、Jenkins、运维平台、Prometheus 与 AIOps**。
 
 > 核心原则：**先证明 Namespace 为什么删不掉，再修复真正负责清理的 Controller，最后才考虑 Break-Glass。**
 >
-> 本工具严格只读，不执行 `delete`、`patch`、`replace`，也不会调用 Namespace `/finalize` 接口。
+> 本工具对 Kubernetes API 严格只读，不执行 `delete`、`patch`、`replace`，也不会调用 Namespace `/finalize`。
 
 ---
 
-## 1. 设计目标
+## 1. v2.0.0 主要变化
 
-Kubernetes Namespace 删除不是 API Server 直接从 etcd 删除对象，而是由 Namespace Controller、Garbage Collector、各种 Operator/CSI/Cloud Controller 共同完成的异步清理流程。
-
-一个 Namespace 长时间处于：
+v2.0.0 将 v1.0.0 单一诊断流程重构为四个子命令：
 
 ```text
-Terminating
+check
+diagnose
+report
+force-check
 ```
 
-常见原因包括：
+新增：
 
-- Namespace Controller 无法完成 API Discovery；
-- 某个 `APIService` 不可用；
-- Namespace 内仍存在 Pod、Secret、Role、PVC、Job 等普通资源；
-- Namespace 内仍存在 CR；
-- Pod/PVC/CR 等对象存在无法完成的 Finalizer；
-- PVC/PV/VolumeAttachment 存储清理没有完成；
-- 对应 Operator/CSI Controller 已经先被删除；
-- Admission Webhook 后端不存在或无 Ready Endpoint；
-- `failurePolicy=Fail` 的 Webhook/VAP 阻断 DELETE/UPDATE/PATCH；
-- Namespace Controller 自身无法正常收敛。
+- `--json` 机器可读输出；
+- Prometheus textfile collector 指标；
+- `NamespaceTerminating > 10m` 集群巡检入口；
+- `namespace-terminating-patrol.sh` 巡检包装脚本；
+- `PrometheusRule` 告警模板；
+- TXT / JSON / `.prom` 三类报告；
+- 更严格的 Force Finalize fail-closed 门禁；
+- v1.0.0 `--report <file>` 兼容入口；
+- 代码模块化拆分，方便后续扩展检查器。
 
-本工具目标不是自动“修掉 Finalizer”，而是建立统一诊断链路：
+目录：
 
 ```text
-Discover
-   ↓
-Locate
-   ↓
-Classify
-   ↓
-Repair
-   ↓
-Verify
-   ↓
-Break-Glass Review
+namespace-terminating-diagnose/
+├── README.md
+├── namespace-terminating-diagnose.sh
+├── namespace-terminating-patrol.sh
+├── lib/
+│   ├── common.sh
+│   ├── resources.sh
+│   ├── storage-admission.sh
+│   ├── output.sh
+│   └── patrol.sh
+└── prometheus/
+    └── namespace-terminating-alerts.yaml
 ```
 
-而不是：
+模块职责：
 
 ```text
-Terminating
-   ↓
-finalizers=[]
+namespace-terminating-diagnose.sh
+        │
+        ├── lib/common.sh
+        │   └── CLI / preflight / logging / 通用函数
+        ├── lib/resources.sh
+        │   └── Namespace / APIService / 全量资源 / Pod
+        ├── lib/storage-admission.sh
+        │   └── PVC/PV/VA / CR / Webhook / VAP
+        ├── lib/output.sh
+        │   └── Verdict / JSON / Prometheus / Report
+        └── lib/patrol.sh
+            └── NamespaceTerminating 集群巡检
 ```
 
 ---
 
-## 2. 核心安全原则
+## 2. 为什么 Namespace 会一直 Terminating
 
-### 2.1 严格只读
+Namespace 删除是一条异步清理链：
 
-脚本只执行 Kubernetes API 的读取操作。
+```text
+kubectl delete namespace
+        │
+        ▼
+delectionTimestamp
+        │
+        ▼
+Namespace Controller
+        │
+        ├── API Discovery
+        ├── 枚举所有 namespaced resources
+        ├── Garbage Collection
+        ├── 等待 Resource Finalizers
+        ├── 等待 Operator / CSI / Cloud Controller
+        └── 确认 Namespace 为空
+                │
+                ▼
+         Namespace Finalizer
+                │
+                ▼
+             Deleted
+```
 
-不会执行：
+常见阻塞包括：
+
+- `APIService` 不可用；
+- API Discovery 不完整；
+- Pod / Job / Secret / Role 等资源仍存在；
+- PVC / PV / VolumeAttachment 未释放；
+- CR 仍存在；
+- 对象带无法完成的 Finalizer；
+- Operator 已提前卸载；
+- CSI / Cloud Controller 异常；
+- Webhook Service 不存在或无 Ready Endpoint；
+- `failurePolicy=Fail` 阻断 DELETE/UPDATE；
+- ValidatingAdmissionPolicy 参与删除链；
+- Namespace Controller 状态没有收敛。
+
+`kubectl get all -n <ns>` 不能覆盖所有 namespaced resource，所以不能作为“Namespace 已清空”的证明。
+
+---
+
+## 3. 安全设计
+
+### 3.1 Kubernetes API 只读
+
+工具不会执行：
 
 ```text
 kubectl delete
@@ -77,168 +131,561 @@ kubectl edit
 PUT /api/v1/namespaces/<ns>/finalize
 ```
 
-所以工具本身可以作为生产环境的第一阶段诊断入口。
+### 3.2 Fail-Closed
 
-### 2.2 Fail-Closed
-
-无法证明安全时，不会给出 `FORCE-FINALIZE-READY`。
-
-例如出现以下任一情况：
+以下任意场景都会阻止 Force Finalize Ready：
 
 ```text
-API Discovery 无法完整执行
-APIService Available != True
-无法 list 某个 Namespaced Resource
-PVC 仍存在
-关联 PV 仍处于 Bound/Terminating
-VolumeAttachment 仍存在
-Custom Resource 仍存在
-对象 metadata.finalizers 仍存在
-Webhook 后端异常且 failurePolicy=Fail
-VAP 可能阻塞 DELETE/UPDATE
+API Discovery 失败
+APIService 不可用
+资源枚举失败
+RBAC 无法 list 某类资源
+仍有 namespaced resource
+仍有 metadata.finalizers
+仍有 CR
+仍有 PVC
+仍有关联 PV
+仍有 VolumeAttachment
+Webhook/VAP 有高风险阻塞
+Namespace Condition 仍报告剩余内容/Finalizer
+删除时长无法验证
 ```
 
-都会阻止进入强制 Finalize 前置状态。
-
-### 2.3 Finalizer 是线索，不是故障本身
-
-例如看到：
+原则：
 
 ```text
-kubernetes.io/pvc-protection
-external-provisioner.volume.kubernetes.io/finalizer
-example.io/finalizer
+无法证明安全
+=
+不能进入 FORCE-FINALIZE-READY
 ```
 
-不意味着应该立即删除 Finalizer。
+### 3.3 Break-Glass 不是自动修复
 
-它更可能意味着：
+`FORCE-FINALIZE-READY` 只表示：
 
 ```text
-存储仍被 Pod 使用
-CSI DeleteVolume 尚未完成
-Operator 外部资源清理失败
-Controller 已经失联
-Admission 阻止了 Finalizer PATCH
+可以进入人工 Break-Glass 复核
 ```
 
-因此推荐：
+不表示脚本会执行 `/finalize`。
+
+---
+
+## 4. 安装与基础使用
+
+依赖：
 
 ```text
-修 Controller / 外部资源
-        ↓
-等待 Finalizer 正常完成
-        ↓
-重新诊断
+Bash >= 4
+kubectl
+jq
+GNU date
+```
+
+建议克隆后赋执行权限：
+
+```bash
+chmod +x namespace-terminating-diagnose.sh
+chmod +x namespace-terminating-patrol.sh
+```
+
+查看版本：
+
+```bash
+./namespace-terminating-diagnose.sh --version
+```
+
+查看帮助：
+
+```bash
+./namespace-terminating-diagnose.sh --help
 ```
 
 ---
 
-## 3. 目录结构
+## 5. 四个子命令
 
-```text
-namespace-terminating-diagnose/
-├── README.md
-└── namespace-terminating-diagnose.sh
+### 5.1 check
+
+轻量检查：
+
+```bash
+./namespace-terminating-diagnose.sh check -n test
 ```
-
-职责：
-
-```text
-README.md
-  └── 原理、诊断链路、风险等级、使用方法、生产 SOP
-
-namespace-terminating-diagnose.sh
-  └── Kubernetes Namespace Terminating 只读自动诊断
-```
-
----
-
-## 4. 总体架构
-
-```text
-                    namespace-terminating-diagnose.sh
-                                  │
-                                  ▼
-                         Kubernetes API
-                                  │
-          ┌───────────────────────┼────────────────────────┐
-          │                       │                        │
-          ▼                       ▼                        ▼
- Namespace State            API Discovery             Admission
- Conditions                 APIService                Webhook / VAP
- finalizers                     │                        │
- deletionTimestamp              │                        │
-          │                      ▼                        │
-          │             Namespaced Resources             │
-          │                      │                        │
-          │          ┌───────────┼────────────┐           │
-          │          │           │            │           │
-          ▼          ▼           ▼            ▼           ▼
-       Pod Check    PVC         CR/CRD      Finalizer   Webhook
-          │          │           │            │         Backend
-          │          ▼           │            │
-          │         PV           │            │
-          │          │           │            │
-          │          ▼           │            │
-          │   VolumeAttachment   │            │
-          │          │           │            │
-          └──────────┴───────────┴────────────┘
-                                  │
-                                  ▼
-                           Risk Aggregation
-                                  │
-              ┌───────────────────┼────────────────────┐
-              │                   │                    │
-              ▼                   ▼                    ▼
-             SAFE              WARNING             DANGEROUS
-                                                       │
-                                                       │
-                                  条件全部满足          │
-                                      │                │
-                                      ▼                │
-                           FORCE-FINALIZE-READY        │
-                                      │                │
-                                      └──────┬─────────┘
-                                             ▼
-                                  人工 Break-Glass 复核
-```
-
----
-
-## 5. 自动检查项
-
-脚本当前按以下顺序执行。
-
-### 5.1 Preflight
 
 检查：
 
-- Bash 版本；
-- `kubectl`；
-- `jq`；
-- 当前 kubeconfig Context；
-- Kubernetes API 连通性；
-- 目标 Namespace 可读取性。
-
-### 5.2 Namespace State / Conditions
-
-读取：
-
-```bash
-kubectl get namespace <namespace> -o json
+```text
+Namespace phase
+delectionTimestamp
+Terminating age
+Namespace Conditions
+Namespace spec.finalizers
+APIService Available
+Aggregated API backend 是否位于目标 Namespace
 ```
 
-重点检查：
+`check` 不做完整资源扫描，因此**永远不会**声明 `FORCE-FINALIZE-READY`。
+
+如果 Namespace 已处于 Terminating，通常返回：
 
 ```text
-status.phase
-metadata.deletionTimestamp
+WARNING
+exit 10
+```
+
+建议继续：
+
+```bash
+./namespace-terminating-diagnose.sh diagnose -n test
+```
+
+### 5.2 diagnose
+
+完整根因诊断：
+
+```bash
+./namespace-terminating-diagnose.sh diagnose -n test
+```
+
+链路：
+
+```text
+Namespace State
+      ↓
+APIService
+      ↓
+Full Namespaced Resource Scan
+      ↓
+Pod
+      ↓
+PVC / PV / VolumeAttachment
+      ↓
+CRD / Custom Resource
+      ↓
+Webhook / VAP
+      ↓
+Risk Summary
+      ↓
+SAFE / WARNING / DANGEROUS
+```
+
+### 5.3 report
+
+完整诊断并生成审计文件：
+
+```bash
+./namespace-terminating-diagnose.sh report \
+  -n test \
+  --output-dir /data/logs/namespace-terminating-diagnose
+```
+
+输出：
+
+```text
+test-YYYYmmdd-HHMMSS.txt
+test-YYYYmmdd-HHMMSS.json
+test-YYYYmmdd-HHMMSS.prom
+```
+
+用于：
+
+- 故障复盘；
+- Jenkins Artifact；
+- AIOps 工单附件；
+- Prometheus textfile collector；
+- Force Finalize 前的审计证据。
+
+### 5.4 force-check
+
+严格判断是否满足人工 Force Finalize 前置条件：
+
+```bash
+./namespace-terminating-diagnose.sh force-check \
+  -n test \
+  --threshold 900
+```
+
+必须同时满足：
+
+```text
+Namespace = Terminating
+Terminating age >= threshold
+Full namespaced resource scan = 0
+Object finalizers = 0
+Custom Resources = 0
+PVC = 0
+Namespace-related PV = 0
+VolumeAttachment = 0
+APIService = Healthy
+Admission = no high-risk blocker
+Namespace Conditions = no active blocker
+scan_errors = 0
+force_blockers = 0
+```
+
+才返回：
+
+```text
+FORCE-FINALIZE-READY
+exit 30
+```
+
+`exit 30` 适合在 Jenkins 中作为**人工审批门**，不是“已执行 finalize”。
+
+---
+
+## 6. Verdict 与 Exit Code
+
+| Verdict | Exit Code | 含义 |
+|---|---:|---|
+| `SAFE` | `0` | 未发现高风险阻塞 |
+| `WARNING` | `10` | 有剩余资源、暂时性状态或验证不完整 |
+| `DANGEROUS` | `20` | 存在明确高风险阻塞或外部资源风险 |
+| `FORCE-FINALIZE-READY` | `30` | 仅 `force-check`：满足人工 Break-Glass 前置条件 |
+| 参数/API 基础错误 | `64` | 工具无法完成基础检查 |
+
+推荐 Jenkins 分流：
+
+```text
+0  -> PASS
+10 -> UNSTABLE / 继续诊断
+20 -> FAIL / 禁止 Force Finalize
+30 -> INPUT APPROVAL
+64 -> TOOL / RBAC / API ERROR
+```
+
+---
+
+## 7. `--json` 机器可读输出
+
+```bash
+./namespace-terminating-diagnose.sh diagnose \
+  -n test \
+  --json
+```
+
+stdout 只输出 JSON，不混入彩色诊断日志。
+
+核心结构：
+
+```json
+{
+  "schema_version": "1",
+  "tool": "namespace-terminating-diagnose",
+  "version": "2.0.0",
+  "command": "diagnose",
+  "namespace": {
+    "name": "test",
+    "phase": "Terminating",
+    "deletion_timestamp": "2026-09-02T01:00:00Z",
+    "terminating_age_seconds": 1200,
+    "spec_finalizers": ["kubernetes"]
+  },
+  "threshold_seconds": 600,
+  "verdict": "WARNING",
+  "exit_code": 10,
+  "force_finalize_ready": false,
+  "counts": {
+    "remaining_objects": 2,
+    "terminating_objects": 2,
+    "objects_with_finalizers": 1,
+    "custom_resources": 0,
+    "pvc": 1,
+    "related_pv": 1,
+    "volume_attachments": 1,
+    "scan_errors": 0
+  },
+  "warnings": [],
+  "dangers": [],
+  "force_blockers": [],
+  "remaining_resources": [],
+  "finalizer_objects": [],
+  "unavailable_apiservices": []
+}
+```
+
+AIOps 建议重点消费：
+
+```text
+namespace.name
+namespace.phase
+namespace.terminating_age_seconds
+verdict
+exit_code
+force_finalize_ready
+counts.*
+warnings[]
+dangers[]
+force_blockers[]
+remaining_resources[]
+finalizer_objects[]
+unavailable_apiservices[]
+```
+
+---
+
+## 8. NamespaceTerminating > 10m 巡检
+
+主脚本入口：
+
+```bash
+./namespace-terminating-diagnose.sh \
+  check \
+  --all-terminating \
+  --threshold 600
+```
+
+`600s = 10m`。
+
+存在超过阈值的 Namespace 时：
+
+```text
+VERDICT: WARNING
+Exit: 10
+```
+
+### 巡检包装脚本
+
+```bash
+./namespace-terminating-patrol.sh
+```
+
+等价于：
+
+```bash
+./namespace-terminating-diagnose.sh \
+  check \
+  --all-terminating \
+  --threshold 600
+```
+
+修改阈值：
+
+```bash
+export NAMESPACE_TERMINATING_THRESHOLD=900
+./namespace-terminating-patrol.sh
+```
+
+JSON：
+
+```bash
+./namespace-terminating-patrol.sh --json
+```
+
+巡检 JSON 结构：
+
+```json
+{
+  "command": "check",
+  "mode": "all-terminating",
+  "threshold_seconds": 600,
+  "verdict": "WARNING",
+  "exit_code": 10,
+  "counts": {
+    "terminating": 2,
+    "over_threshold": 1,
+    "unknown_age": 0
+  },
+  "namespaces": [
+    {
+      "namespace": "test",
+      "phase": "Terminating",
+      "deletion_timestamp": "2026-09-02T01:00:00Z",
+      "age_seconds": 1800,
+      "over_threshold": true
+    }
+  ]
+}
+```
+
+---
+
+## 9. Prometheus 指标
+
+### 单 Namespace
+
+```bash
+./namespace-terminating-diagnose.sh diagnose \
+  -n test \
+  --prometheus-output /tmp/test.prom
+```
+
+指标：
+
+```text
+namespace_terminating_diagnose_info
+namespace_terminating_diagnose_terminating_age_seconds
+namespace_terminating_diagnose_remaining_objects
+namespace_terminating_diagnose_terminating_objects
+namespace_terminating_diagnose_objects_with_finalizers
+namespace_terminating_diagnose_custom_resources
+namespace_terminating_diagnose_pvc
+namespace_terminating_diagnose_related_pv
+namespace_terminating_diagnose_volume_attachments
+namespace_terminating_diagnose_scan_errors
+namespace_terminating_diagnose_force_finalize_ready
+namespace_terminating_diagnose_generated_timestamp_seconds
+```
+
+### 集群巡检
+
+```bash
+./namespace-terminating-patrol.sh \
+  --prometheus-output \
+  /var/lib/node_exporter/textfile_collector/namespace_terminating.prom
+```
+
+指标：
+
+```text
+namespace_terminating_diagnose_patrol_terminating_total
+namespace_terminating_diagnose_patrol_over_threshold_total
+namespace_terminating_diagnose_patrol_unknown_age_total
+namespace_terminating_diagnose_namespace_terminating{namespace="..."}
+namespace_terminating_diagnose_namespace_terminating_age_seconds{namespace="..."}
+namespace_terminating_diagnose_namespace_over_threshold{namespace="...",threshold_seconds="600"}
+namespace_terminating_diagnose_generated_timestamp_seconds{mode="patrol"}
+```
+
+指标文件采用：
+
+```text
+临时文件
+  ↓
+完整写入
+  ↓
+mv 原子替换
+```
+
+避免 Node Exporter 抓到半写入文件。
+
+---
+
+## 10. PrometheusRule
+
+项目提供：
+
+```text
+prometheus/namespace-terminating-alerts.yaml
+```
+
+应用：
+
+```bash
+kubectl apply -f \
+  namespace-terminating-diagnose/prometheus/namespace-terminating-alerts.yaml
+```
+
+包含：
+
+### NamespaceTerminatingOverThreshold
+
+```promql
+namespace_terminating_diagnose_namespace_over_threshold == 1
+```
+
+### NamespaceTerminatingPatrolStale
+
+同时检测指标缺失和超过 15 分钟未更新：
+
+```promql
+absent(
+  namespace_terminating_diagnose_generated_timestamp_seconds{mode="patrol"}
+)
+or
+(
+  time()
+  - namespace_terminating_diagnose_generated_timestamp_seconds{mode="patrol"}
+  > 900
+)
+```
+
+### NamespaceTerminatingPatrolUnknownAge
+
+```promql
+namespace_terminating_diagnose_patrol_unknown_age_total > 0
+```
+
+---
+
+## 11. Cron / Node Exporter
+
+每 5 分钟巡检：
+
+```cron
+*/5 * * * * /opt/namespace-terminating-diagnose/namespace-terminating-patrol.sh --prometheus-output /var/lib/node_exporter/textfile_collector/namespace_terminating.prom >> /var/log/namespace-terminating-patrol.log 2>&1
+```
+
+注意：
+
+```text
+exit 10
+```
+
+代表“发现超阈值 Namespace”，属于业务告警状态，不是工具崩溃。
+
+---
+
+## 12. Jenkins 集成
+
+巡检：
+
+```groovy
+stage('Namespace Terminating Patrol') {
+    steps {
+        script {
+            int rc = sh(
+                script: '''
+                  ./namespace-terminating-diagnose/namespace-terminating-patrol.sh \
+                    --json > namespace-terminating.json
+                ''',
+                returnStatus: true
+            )
+
+            archiveArtifacts artifacts: 'namespace-terminating.json'
+
+            if (rc == 10) {
+                unstable('存在 Namespace Terminating 超过 10 分钟')
+            } else if (rc != 0) {
+                error("namespace patrol failed, exit=${rc}")
+            }
+        }
+    }
+}
+```
+
+报告任务建议同样使用 `returnStatus`，因为 `report` 会保留诊断 Verdict 的 Exit Code：
+
+```groovy
+int rc = sh(
+    script: '''
+      ./namespace-terminating-diagnose/namespace-terminating-diagnose.sh \
+        report \
+        -n "${TARGET_NAMESPACE}" \
+        --output-dir namespace-report
+    ''',
+    returnStatus: true
+)
+
+archiveArtifacts artifacts: 'namespace-report/**'
+```
+
+---
+
+## 13. 完整诊断范围
+
+### Namespace
+
+```text
+phase
+delectionTimestamp
+terminating age
 spec.finalizers
 status.conditions
 ```
 
-识别以下 Condition：
+重点 Condition：
 
 ```text
 NamespaceDeletionDiscoveryFailure
@@ -248,41 +695,16 @@ NamespaceContentRemaining
 NamespaceFinalizersRemaining
 ```
 
-### 5.3 APIService / Aggregated API
+### APIService
 
-检查：
-
-```bash
-kubectl get apiservice
-```
-
-只要存在：
+识别：
 
 ```text
 Available != True
+APIService backend Service 位于待删除 Namespace
 ```
 
-就按高风险处理。
-
-另外还会识别：
-
-```text
-APIService.spec.service.namespace == TARGET_NAMESPACE
-```
-
-因为删除目标 Namespace 本身可能直接破坏 Aggregated API Backend，进一步阻断 Namespace Controller Discovery。
-
-### 5.4 完整 Namespaced Resource Scan
-
-脚本不依赖：
-
-```bash
-kubectl get all
-```
-
-因为 `get all` 并不包含全部 Kubernetes Namespaced Resource。
-
-脚本使用：
+### Full Namespaced Resource Scan
 
 ```bash
 kubectl api-resources \
@@ -291,62 +713,34 @@ kubectl api-resources \
   -o name
 ```
 
-然后逐一：
+然后逐个 `kubectl get <resource> -n <namespace> -o json`。
 
-```bash
-kubectl get <resource> \
-  -n <namespace> \
-  --ignore-not-found \
-  -o json
-```
-
-统计：
-
-- 剩余对象总数；
-- `deletionTimestamp != null` 的对象；
-- `metadata.finalizers` 非空的对象；
-- 无法 List 的 Resource。
-
-只要任何 Resource 无法读取，脚本就不会证明 Namespace 已经安全清空。
-
-### 5.5 Pod Deep Check
+### Pod
 
 检查：
 
 ```text
-Pod Phase
-Pod deletionTimestamp
-Pod finalizers
-Pod 所在 Node
-Node Ready 状态
+phase
+nodeName
+Node Ready
+deletionTimestamp
+finalizers
 ```
 
-可用于辅助定位：
-
-```text
-Node 已永久 NotReady
-Pod 长时间 Terminating
-Job Tracking Finalizer
-preStop / graceful termination 异常
-```
-
-### 5.6 PVC / PV / VolumeAttachment
+### Storage
 
 检查：
 
 ```text
 PVC
-  ↓
-关联 PV
-  ↓
-PersistentVolumeReclaimPolicy
-  ↓
-PV Finalizer
-  ↓
+PV claimRef.namespace
+PV phase
+reclaimPolicy
+PV finalizers
 VolumeAttachment
 ```
 
-重点识别：
+重点 Finalizer：
 
 ```text
 kubernetes.io/pvc-protection
@@ -354,747 +748,199 @@ kubernetes.io/pv-protection
 external-provisioner.volume.kubernetes.io/finalizer
 ```
 
-存在 PVC 或高风险 PV/VolumeAttachment 时，禁止进入 Force Finalize Ready。
+### CR / Operator
 
-### 5.7 CRD / Custom Resource
+通过 Namespaced CRD 自动识别剩余 CR。只要仍有 CR，工具判为高风险，要求先确认对应 Operator / Finalizer。
 
-读取全部：
-
-```bash
-kubectl get crd
-```
-
-筛选：
-
-```text
-spec.scope == Namespaced
-```
-
-再与前面的完整资源扫描结果交叉比对。
-
-只要 Namespace 中仍有 Custom Resource：
-
-```text
-CR remains
-```
-
-就进入 `DANGEROUS`。
-
-原因是 CR 通常意味着对应 Operator 仍有外部资源、状态机或 Finalizer 需要完成。
-
-### 5.8 Admission Webhook
+### Admission
 
 检查：
 
 ```text
 ValidatingWebhookConfiguration
 MutatingWebhookConfiguration
+ValidatingAdmissionPolicy
+ValidatingAdmissionPolicyBinding
 ```
 
-重点分析：
+重点：
 
 ```text
-operations:
-  DELETE
-  UPDATE
-  *
-
-failurePolicy: Fail
-```
-
-并进一步检查 Webhook Backend：
-
-```text
-Service
-  ↓
-EndpointSlice
-  ↓
-Ready Endpoint
-```
-
-如果：
-
-```text
+DELETE / UPDATE / *
++
 failurePolicy=Fail
 +
-Service 不存在 / 无 Ready Endpoint
+Service missing / no ready endpoint
 ```
-
-则视为高风险删除链路阻塞。
-
-### 5.9 ValidatingAdmissionPolicy
-
-如果集群支持：
-
-```text
-validatingadmissionpolicies
-validatingadmissionpolicybindings
-```
-
-脚本会检查可能涉及：
-
-```text
-DELETE
-UPDATE
-*
-```
-
-的 Policy。
-
-尤其关注：
-
-```text
-failurePolicy=Fail
-validationActions=Deny
-```
-
-以及：
-
-```text
-paramRef.namespace == TARGET_NAMESPACE
-```
-
-因为目标 Namespace 删除过程中，Policy 参数对象本身可能先消失，从而产生删除顺序死锁。
 
 ---
 
-## 6. 四级风险判定
+## 14. RBAC
 
-脚本统一输出以下四种 Verdict。
-
-| Verdict | Exit Code | 含义 | 建议 |
-|---|---:|---|---|
-| `SAFE` | `0` | 未发现高风险删除阻塞 | 正常观察 Namespace Controller 收敛 |
-| `WARNING` | `10` | 仍有普通资源、暂时性 Terminating 对象或未完全验证项 | 继续等待或修复后重新诊断 |
-| `DANGEROUS` | `20` | 存在存储、CR、Finalizer、APIService、Admission 等高风险阻塞 | 禁止强制 Finalize |
-| `FORCE-FINALIZE-READY` | `30` | 已满足进入人工 Break-Glass 复核的前置条件 | 人工确认外部资源后再决定是否 `/finalize` |
-
-### 6.1 SAFE
-
-例如：
-
-```text
-Namespace 刚进入 Terminating
-APIService 正常
-没有高风险 Finalizer
-没有 Storage/CR/Admission 问题
-```
-
-此时优先：
-
-```text
-继续等待 Controller 正常完成删除
-```
-
-而不是立即 Force Finalize。
-
-### 6.2 WARNING
-
-典型情况：
-
-```text
-普通资源仍在删除
-NamespaceContentRemaining=True
-Terminating 时间还没有超过阈值
-某项检查只能部分验证
-```
-
-说明当前还没有证据进入 Break-Glass。
-
-### 6.3 DANGEROUS
-
-出现以下任一类问题通常会进入：
-
-```text
-DANGEROUS
-```
-
-例如：
-
-```text
-NamespaceFinalizersRemaining=True
-NamespaceDeletionDiscoveryFailure=True
-APIService Available=False
-PVC remains
-PV Bound/Terminating
-VolumeAttachment remains
-Custom Resource remains
-Object metadata.finalizers != []
-Fail Webhook Backend unavailable
-VAP paramRef located in target Namespace
-```
-
-这类情况应该修复根因，而不是清空 Namespace Finalizer。
-
-### 6.4 FORCE-FINALIZE-READY
-
-只有满足类似以下条件时才会进入：
-
-```text
-Namespace.phase == Terminating
-        +
-Terminating age >= threshold
-        +
-Remaining Namespaced Resource == 0
-        +
-Object Finalizer == 0
-        +
-APIService Discovery 正常
-        +
-PVC / 高风险 PV / VolumeAttachment == 0
-        +
-Custom Resource == 0
-        +
-Admission 无已知高风险阻塞
-        +
-SCAN_ERRORS == 0
-        +
-FORCE_BLOCKERS == 0
-```
-
-注意：
-
-```text
-FORCE-FINALIZE-READY
-```
-
-不是：
-
-```text
-SAFE TO DELETE EXTERNAL RESOURCES
-```
-
-它只是说明 Kubernetes API 层面的只读检查没有发现已知阻塞，可以进入人工 Break-Glass Review。
-
----
-
-## 7. 环境要求
-
-### 7.1 Bash
-
-要求：
-
-```text
-Bash >= 4
-```
-
-脚本使用：
-
-```text
-declare -A
-mapfile
-process substitution
-Bash arrays
-```
-
-### 7.2 必需命令
-
-```text
-kubectl
-jq
-date
-```
-
-其中 `date` 推荐 GNU coreutils 版本，因为脚本使用：
-
-```bash
-date -d <RFC3339 timestamp> +%s
-```
-
-如果无法解析 `deletionTimestamp`：
-
-```text
-FORCE-FINALIZE-READY
-```
-
-会被主动禁用。
-
-### 7.3 Kubernetes 版本
-
-推荐：
-
-```text
-Kubernetes v1.34+
-```
-
-脚本对 ValidatingAdmissionPolicy 做能力探测，不支持该 API 的集群会自动跳过对应检查。
-
----
-
-## 8. Kubernetes 权限要求
-
-脚本是只读工具，但为了完成完整诊断，执行账号需要同时拥有 Namespaced 和 Cluster-Scoped Resource 的 `get/list` 权限。
-
-典型权限包括：
+完整 `diagnose / report / force-check` 至少需要读取：
 
 ```text
 namespaces
 nodes
+pods
+persistentvolumeclaims
 persistentvolumes
 volumeattachments
-customresourcedefinitions
 apiservices
+customresourcedefinitions
 validatingwebhookconfigurations
 mutatingwebhookconfigurations
 validatingadmissionpolicies
 validatingadmissionpolicybindings
-所有可 list 的 namespaced resources
 ```
 
-生产上建议使用独立诊断账号，并遵循最小权限原则。
+同时需要对集群中所有支持：
 
-可以先检查：
-
-```bash
-kubectl auth can-i get namespace <namespace>
-kubectl auth can-i list apiservices.apiregistration.k8s.io
-kubectl auth can-i list persistentvolumes
-kubectl auth can-i list volumeattachments.storage.k8s.io
-kubectl auth can-i list customresourcedefinitions.apiextensions.k8s.io
+```text
+verbs=list
+namespaced=true
 ```
 
-如果权限不足，脚本会产生 Scan Error，并阻止 `FORCE-FINALIZE-READY`。
+的资源执行 `list`。
+
+生产环境建议使用专用只读 ServiceAccount / kubeconfig，只授予 `get/list`，不要授予 `delete/patch/update`。
 
 ---
 
-## 9. 命令行参数
+## 15. 与 kube-state-metrics 的关系
 
-查看帮助：
+已有 kube-state-metrics 时，可通过：
 
-```bash
-./namespace-terminating-diagnose.sh --help
+```promql
+kube_namespace_status_phase{phase="Terminating"} == 1
 ```
 
-参数：
+做基础监控。
 
-| 参数 | 默认值 | 含义 |
-|---|---:|---|
-| `-n, --namespace` | 无 | 目标 Namespace，必填 |
-| `--request-timeout` | `10s` | 单次 kubectl API 请求超时 |
-| `--threshold` | `300` | Terminating 超过多少秒才允许 FORCE-READY 评估 |
-| `--max-details` | `20` | 每类详细对象最多输出数量 |
-| `--report` | 空 | 同时保存完整诊断报告 |
-| `--no-color` | false | 禁用终端颜色 |
-| `-V, --version` | - | 输出版本 |
-
----
-
-## 10. 使用方法
-
-### 10.1 基础诊断
-
-```bash
-chmod +x namespace-terminating-diagnose.sh
-
-./namespace-terminating-diagnose.sh \
-  -n test
-```
-
-### 10.2 生产环境建议
-
-建议同时保存报告：
-
-```bash
-./namespace-terminating-diagnose.sh \
-  -n pro-yunfan \
-  --threshold 900 \
-  --report /tmp/pro-yunfan-namespace-diagnose.log
-```
-
-这样可以把本次诊断结果作为：
+本工具不替代 kube-state-metrics，而是补充：
 
 ```text
-故障记录
-变更审批证据
-Break-Glass 前置证据
-事后复盘资料
-```
-
-### 10.3 CI / 自动化平台
-
-脚本 Exit Code 可以直接接 Jenkins、巡检平台或 AIOps：
-
-```bash
-./namespace-terminating-diagnose.sh -n test
-rc=$?
-
-case "$rc" in
-  0)
-    echo "SAFE"
-    ;;
-  10)
-    echo "WARNING"
-    ;;
-  20)
-    echo "DANGEROUS"
-    ;;
-  30)
-    echo "FORCE-FINALIZE-READY"
-    ;;
-  *)
-    echo "TOOL ERROR"
-    ;;
-esac
-```
-
----
-
-## 11. 推荐生产排障流程
-
-统一使用：
-
-```text
-Namespace Terminating
-        │
-        ▼
-1. Namespace Conditions
-        │
-        ▼
-2. APIService / Discovery
-        │
-        ▼
-3. 完整 Namespaced Resource Scan
-        │
-        ▼
-4. deletionTimestamp / Finalizers
-        │
-        ├──────────┐
-        │          │
-        ▼          ▼
-5. Pod        6. PVC / PV / VA
-        │          │
-        └─────┬────┘
-              ▼
-7. CR / Operator
-              │
-              ▼
-8. Webhook / VAP
-              │
-              ▼
-9. Risk Verdict
-              │
-      ┌───────┼─────────────┐
-      │       │             │
-     SAFE   WARNING      DANGEROUS
-                             │
-                             ▼
-                       修复真实根因
-                             │
-                             ▼
-                         重新诊断
-
-仅当所有前置条件满足：
-
-FORCE-FINALIZE-READY
-        │
-        ▼
-人工 Break-Glass Review
-```
-
----
-
-## 12. 常见故障场景
-
-### 12.1 Pod 一直 Terminating
-
-重点查看：
-
-```text
-Pod deletionTimestamp
-Pod finalizers
-Node Ready
-OwnerReferences
-```
-
-如果 Node 已经永久失联，要特别注意有状态应用和 RWO 存储，避免强制删除 Pod 后产生双写或 split-brain。
-
-### 12.2 PVC 一直 Terminating
-
-常见：
-
-```text
-kubernetes.io/pvc-protection
-```
-
-优先确认：
-
-```text
-是否仍被 Pod 使用
-PV 状态
-VolumeAttachment
-CSI Controller
-```
-
-### 12.3 PV / CSI 删除失败
-
-重点查看：
-
-```text
-PV phase
-reclaimPolicy
-PV deletionTimestamp
-external-provisioner.volume.kubernetes.io/finalizer
-VolumeAttachment
-```
-
-不要直接清 CSI Finalizer，否则可能产生实际云盘泄漏或后端存储状态不一致。
-
-### 12.4 CR / Operator Finalizer
-
-典型错误顺序：
-
-```text
-先删除 Operator
-      ↓
-再删除 CR
-      ↓
-Finalizer 没有 Controller 处理
-      ↓
-Namespace 永久 Terminating
+Terminating age
+统一 Exit Code
+JSON 巡检接口
+自动 diagnose/report 链路
+Force Finalize 门禁
 ```
 
 推荐：
 
 ```text
-删除 CR
-   ↓
-Operator 完成清理
-   ↓
-Finalizer 消失
-   ↓
-删除 Operator
-   ↓
-删除 CRD / Namespace
-```
+kube-state-metrics
+    └── 基础状态告警
 
-### 12.5 APIService Discovery Failure
-
-例如：
-
-```text
-metrics-server
-prometheus-adapter
-custom metrics adapter
-aggregated apiserver
-```
-
-如果 APIService 已注册但 Backend 不可用，Namespace Controller 可能无法证明 Namespace 已清空。
-
-### 12.6 Admission Webhook 阻塞删除
-
-典型组合：
-
-```text
-WebhookConfiguration exists
-        +
-Webhook Service deleted
-        +
-failurePolicy=Fail
-        ↓
-DELETE / UPDATE 被拒绝
-        ↓
-Finalizer 无法更新
-        ↓
-Namespace Terminating
+namespace-terminating-diagnose
+    ├── 工程巡检
+    ├── 自动诊断
+    ├── 结构化报告
+    └── Break-Glass Gate
 ```
 
 ---
 
-## 13. Break-Glass 边界
+## 16. v1.0.0 迁移
 
-只有脚本输出：
-
-```text
-VERDICT: FORCE-FINALIZE-READY
-```
-
-才建议进入人工复核。
-
-但在真正调用 `/finalize` 前，至少必须确认：
-
-```text
-[ ] Namespace 确实应该删除
-[ ] 业务 Owner 已确认
-[ ] 数据 Owner 已确认
-[ ] 不存在需要保留的 PVC/PV 数据
-[ ] 不存在云盘残留
-[ ] 不存在 LoadBalancer / 公网 IP / DNS 残留
-[ ] 不存在数据库 Operator 外部资源
-[ ] 不存在 Snapshot / Backup 残留
-[ ] CSI / Operator / Cloud Controller 不再需要完成清理
-[ ] 已保存 Namespace YAML
-[ ] 已保存本工具诊断报告
-[ ] 已准备 Force Finalize 后的 Orphan Resource Audit
-```
-
-本脚本不会自动执行这一步。
-
----
-
-## 14. 强制 Finalize 后的审计建议
-
-如果最终人工执行了 Namespace `/finalize`，不能以：
+v1.0.0：
 
 ```bash
-kubectl get namespace
+./namespace-terminating-diagnose.sh \
+  -n test \
+  --report /tmp/test.log
 ```
 
-发现 Namespace 消失作为故障结束条件。
-
-至少继续检查：
+v2.0.0：
 
 ```bash
-kubectl get pv
-kubectl get volumeattachments
-kubectl get apiservice
-kubectl get crd
+./namespace-terminating-diagnose.sh \
+  diagnose \
+  -n test \
+  --report /tmp/test.log
 ```
 
-同时根据环境检查：
+推荐新系统使用：
 
-```text
-云盘
-NFS/NAS
-Ceph/RBD
-Longhorn Volume
-LoadBalancer
-公网 IP
-Security Group
-ENI
-DNS
-Snapshot
-Backup
-数据库实例
-```
-
-目标是确认不存在 Orphaned Infrastructure。
-
----
-
-## 15. 输出示例
-
-### 15.1 高风险存储场景
-
-```text
-== 8. Risk Summary ==
-[INFO] remaining namespaced objects : 3
-[INFO] objects with finalizers      : 2
-[INFO] remaining Custom Resources   : 1
-
-Danger findings:
-  - persistentvolumeclaims has object(s) with metadata.finalizers
-  - PV pvc-xxxx still has CSI backend-deletion protection finalizer
-  - VolumeAttachment remains
-  - Custom Resource remains
-
-== 9. Final Verdict ==
-VERDICT: DANGEROUS
-Exit   : 20
-```
-
-### 15.2 满足 Break-Glass 前置条件
-
-```text
-== 8. Risk Summary ==
-[INFO] remaining namespaced objects : 0
-[INFO] terminating objects          : 0
-[INFO] objects with finalizers      : 0
-[INFO] remaining Custom Resources   : 0
-[INFO] scan errors                  : 0
-
-== 9. Final Verdict ==
-VERDICT: FORCE-FINALIZE-READY
-Exit   : 30
+```bash
+./namespace-terminating-diagnose.sh \
+  report \
+  -n test \
+  --output-dir /tmp/ns-report
 ```
 
 ---
 
-## 16. Exit Code
+## 17. Break-Glass 清单
 
-| Code | Meaning |
-|---:|---|
-| `0` | SAFE |
-| `10` | WARNING |
-| `20` | DANGEROUS |
-| `30` | FORCE-FINALIZE-READY |
-| `64` | 参数、依赖或 Kubernetes 基础访问错误 |
-
-注意：
+即使 `FORCE-FINALIZE-READY`，也必须人工确认：
 
 ```text
-30 != success
+[ ] Namespace 确实应该永久删除
+[ ] 业务 Owner 同意
+[ ] 数据 Owner 同意
+[ ] PVC/PV 已确认
+[ ] 云盘/共享存储已确认
+[ ] LoadBalancer / DNS / EIP 已确认
+[ ] 数据库 Operator 外部资源已确认
+[ ] Snapshot / Backup 已确认
+[ ] Operator 不再需要完成清理
+[ ] CSI / Cloud Controller 不再需要完成清理
+[ ] 已保存 report / JSON
+[ ] 已制定 Force Finalize 后 Orphan Audit
 ```
 
-`30` 是专门设计给自动化平台识别的“需要人工 Break-Glass Review”状态。
+工具不会执行 `/finalize`。
 
 ---
 
-## 17. 已知边界
-
-当前 v1.0.0 仍有以下边界：
-
-1. 无法直接确认 AWS/Azure/阿里云等云平台中的真实磁盘/LB/DNS 是否已删除；
-2. 无法理解任意第三方 Finalizer 的具体业务语义；
-3. Admission Webhook 的 `namespaceSelector` / `objectSelector` 是否真正匹配目标对象，目前采用保守风险判断；
-4. 无法替代 CSI/Operator Controller 日志分析；
-5. 不自动读取 kube-controller-manager 日志；
-6. 不执行任何修复动作；
-7. 不自动 Force Finalize。
-
-这些边界是刻意保留的安全设计，而不是通过扩大脚本写权限来解决。
-
----
-
-## 18. 后续工程规划
-
-建议后续版本继续演进：
+## 18. 推荐生产链路
 
 ```text
-v1.1
-├── check
-├── diagnose
-├── report
-└── force-check
+check --all-terminating
+        │
+        ├── <= 10m -> SAFE
+        │
+        └── > 10m -> WARNING
+                       │
+                       ▼
+                 diagnose --json
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+        SAFE        WARNING      DANGEROUS
+                                  │
+                                  ▼
+                             修复 Controller
+                                  │
+                                  ▼
+                               report
+                                  │
+                                  ▼
+                             force-check
+                                  │
+                                  ▼
+                    FORCE-FINALIZE-READY
+                                  │
+                                  ▼
+                         人工 Break-Glass
 ```
 
-增加：
-
-- `--json` 机器可读输出；
-- `--quiet` 自动化模式；
-- Finalizer Owner / Controller 映射；
-- CSI Controller 健康关联；
-- Operator Deployment 自动关联；
-- kube-controller-manager Namespace 日志提示；
-- Prometheus Exporter；
-- `NamespaceTerminating > N minutes` 集群巡检模式；
-- Jenkins / AIOps 集成；
-- 独立只读 RBAC Manifest；
-- GitHub Actions `bash -n + ShellCheck`。
-
----
-
-## 19. 生产原则总结
-
-推荐把 Namespace Terminating 的处理原则统一为：
+推荐流程：
 
 ```text
-先看 Condition
-     ↓
-再看 Discovery
-     ↓
-再枚举全部资源
-     ↓
-定位 Finalizer Owner
-     ↓
-检查 Storage / CR / Admission
-     ↓
-修 Controller / 外部资源
-     ↓
-重新验证
-     ↓
-最后才考虑 Break-Glass
+巡检
+→ 诊断
+→ 修复根因
+→ 报告
+→ Force Gate
+→ 人工审批
 ```
 
-一句话：
+而不是：
 
-> **Finalizer 是 Kubernetes 用来保护真实清理事务的机制。生产环境中最危险的操作不是 Namespace Terminating，而是在不知道 Finalizer 为什么存在时把它直接删除。**
+```text
+Terminating
+→ finalizers=[]
+```
