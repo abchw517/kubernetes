@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# Mock kubectl for namespace-terminating-diagnose contract tests.
+set -euo pipefail
+
+SCENARIO="${MOCK_SCENARIO:-clean}"
+
+# kubectl global flags may appear before the command.
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --request-timeout=*) ;;
+    *) args+=("$arg") ;;
+  esac
+done
+set -- "${args[@]}"
+
+empty_list() {
+  printf '%s\n' '{"apiVersion":"v1","items":[]}'
+}
+
+namespace_json() {
+  local name="${1:-test}"
+  cat <<EOF
+{
+  "apiVersion":"v1",
+  "kind":"Namespace",
+  "metadata":{
+    "name":"${name}",
+    "deletionTimestamp":"2020-01-01T00:00:00Z"
+  },
+  "spec":{"finalizers":["kubernetes"]},
+  "status":{"phase":"Terminating","conditions":[]}
+}
+EOF
+}
+
+pvc_list() {
+  if [[ "$SCENARIO" == "pvc" ]]; then
+    cat <<'EOF'
+{
+  "apiVersion":"v1",
+  "items":[{
+    "apiVersion":"v1",
+    "kind":"PersistentVolumeClaim",
+    "metadata":{
+      "name":"data",
+      "namespace":"test",
+      "deletionTimestamp":"2020-01-01T00:00:00Z",
+      "finalizers":["kubernetes.io/pvc-protection"]
+    },
+    "spec":{"volumeName":"pv-data"},
+    "status":{"phase":"Bound"}
+  }]
+}
+EOF
+  else
+    empty_list
+  fi
+}
+
+pv_list() {
+  if [[ "$SCENARIO" == "pvc" ]]; then
+    cat <<'EOF'
+{
+  "apiVersion":"v1",
+  "items":[{
+    "apiVersion":"v1",
+    "kind":"PersistentVolume",
+    "metadata":{
+      "name":"pv-data",
+      "deletionTimestamp":"2020-01-01T00:00:00Z",
+      "finalizers":["external-provisioner.volume.kubernetes.io/finalizer"]
+    },
+    "spec":{
+      "claimRef":{"namespace":"test","name":"data"},
+      "persistentVolumeReclaimPolicy":"Delete",
+      "storageClassName":"mock-csi"
+    },
+    "status":{"phase":"Bound"}
+  }]
+}
+EOF
+  else
+    empty_list
+  fi
+}
+
+volumeattachment_list() {
+  if [[ "$SCENARIO" == "pvc" ]]; then
+    cat <<'EOF'
+{
+  "apiVersion":"storage.k8s.io/v1",
+  "items":[{
+    "apiVersion":"storage.k8s.io/v1",
+    "kind":"VolumeAttachment",
+    "metadata":{"name":"csi-mock-attachment"},
+    "spec":{
+      "nodeName":"worker-1",
+      "source":{"persistentVolumeName":"pv-data"}
+    },
+    "status":{"attached":true}
+  }]
+}
+EOF
+  else
+    empty_list
+  fi
+}
+
+apiservice_list() {
+  if [[ "$SCENARIO" == "discovery" ]]; then
+    cat <<'EOF'
+{
+  "apiVersion":"apiregistration.k8s.io/v1",
+  "items":[{
+    "metadata":{"name":"v1beta1.metrics.k8s.io"},
+    "spec":{"service":{"namespace":"kube-system","name":"metrics-server"}},
+    "status":{"conditions":[{
+      "type":"Available",
+      "status":"False",
+      "reason":"ServiceNotFound",
+      "message":"mock aggregated API unavailable"
+    }]}
+  }]
+}
+EOF
+  else
+    cat <<'EOF'
+{
+  "apiVersion":"apiregistration.k8s.io/v1",
+  "items":[{
+    "metadata":{"name":"v1.mock.local"},
+    "spec":{},
+    "status":{"conditions":[{"type":"Available","status":"True"}]}
+  }]
+}
+EOF
+  fi
+}
+
+namespaces_list() {
+  cat <<'EOF'
+{
+  "apiVersion":"v1",
+  "items":[
+    {
+      "metadata":{
+        "name":"old-terminating",
+        "deletionTimestamp":"2020-01-01T00:00:00Z"
+      },
+      "status":{"phase":"Terminating"}
+    }
+  ]
+}
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  echo "mock kubectl: missing command" >&2
+  exit 1
+fi
+
+case "$1" in
+  config)
+    if [[ "${2:-}" == "current-context" ]]; then
+      echo "mock-context"
+      exit 0
+    fi
+    ;;
+
+  version)
+    if [[ " $* " == *" --client "* ]]; then
+      printf '%s\n' '{"clientVersion":{"gitVersion":"v1.36.0"}}'
+    else
+      printf '%s\n' '{"clientVersion":{"gitVersion":"v1.36.0"},"serverVersion":{"gitVersion":"v1.36.0"}}'
+    fi
+    exit 0
+    ;;
+
+  api-resources)
+    if [[ " $* " == *" --api-group=admissionregistration.k8s.io "* ]]; then
+      # Keep VAP unavailable in base mocks; webhook objects are still exercised as empty lists.
+      exit 0
+    fi
+
+    cat <<'EOF'
+pods
+persistentvolumeclaims
+configmaps
+EOF
+    exit 0
+    ;;
+
+  get)
+    resource="${2:-}"
+    case "$resource" in
+      namespace|namespaces)
+        if [[ "$resource" == "namespaces" && $# -le 3 ]]; then
+          namespaces_list
+        elif [[ "$resource" == "namespaces" && " ${*:3} " == *" -o json "* ]]; then
+          namespaces_list
+        elif [[ -n "${3:-}" && "${3:-}" != "-o" ]]; then
+          namespace_json "${3}"
+        else
+          namespaces_list
+        fi
+        exit 0
+        ;;
+
+      apiservice|apiservices|apiservices.apiregistration.k8s.io)
+        apiservice_list
+        exit 0
+        ;;
+
+      pods)
+        empty_list
+        exit 0
+        ;;
+
+      nodes)
+        empty_list
+        exit 0
+        ;;
+
+      persistentvolumeclaims|pvc)
+        pvc_list
+        exit 0
+        ;;
+
+      persistentvolumes|pv)
+        pv_list
+        exit 0
+        ;;
+
+      volumeattachments.storage.k8s.io|volumeattachments)
+        volumeattachment_list
+        exit 0
+        ;;
+
+      customresourcedefinitions.apiextensions.k8s.io|customresourcedefinitions|crd)
+        empty_list
+        exit 0
+        ;;
+
+      validatingwebhookconfigurations.admissionregistration.k8s.io|validatingwebhookconfigurations)
+        empty_list
+        exit 0
+        ;;
+
+      mutatingwebhookconfigurations.admissionregistration.k8s.io|mutatingwebhookconfigurations)
+        empty_list
+        exit 0
+        ;;
+
+      validatingadmissionpolicies.admissionregistration.k8s.io|validatingadmissionpolicies)
+        empty_list
+        exit 0
+        ;;
+
+      validatingadmissionpolicybindings.admissionregistration.k8s.io|validatingadmissionpolicybindings)
+        empty_list
+        exit 0
+        ;;
+
+      configmaps)
+        empty_list
+        exit 0
+        ;;
+
+      services|service)
+        empty_list
+        exit 0
+        ;;
+
+      endpointslices.discovery.k8s.io|endpointslices)
+        empty_list
+        exit 0
+        ;;
+
+      *)
+        # Unknown namespaced resource: model it as successfully listable and empty.
+        empty_list
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+
+echo "mock kubectl: unsupported invocation: $*" >&2
+exit 1
