@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/resource-result.schema.json",
+  "title": "resource-terminating-diagnose result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tool",
+    "version",
+    "command",
+    "generated_at",
+    "target",
+    "threshold_seconds",
+    "verdict",
+    "verdict_reason",
+    "exit_code",
+    "break_glass_review_ready",
+    "counts",
+    "warnings",
+    "dangers",
+    "blockers",
+    "chain"
+  ],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "tool": {"const": "resource-terminating-diagnose"},
+    "version": {"type": "string"},
+    "command": {"enum": ["check", "diagnose", "report", "force-check"]},
+    "generated_at": {"type": "string"},
+    "target": {
+      "type": "object",
+      "required": ["kind", "namespace", "name", "uid", "phase_or_status", "deletion_timestamp", "terminating_age_seconds", "finalizers"],
+      "properties": {
+        "kind": {"enum": ["pod", "pvc", "pv", "volumeattachment"]},
+        "namespace": {"type": ["string", "null"]},
+        "name": {"type": "string", "minLength": 1},
+        "uid": {"type": "string"},
+        "phase_or_status": {"type": "string"},
+        "deletion_timestamp": {"type": ["string", "null"]},
+        "terminating_age_seconds": {"type": "integer", "minimum": -1},
+        "finalizers": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "threshold_seconds": {"type": "integer", "minimum": 0},
+    "verdict": {"enum": ["SAFE", "WARNING", "DANGEROUS", "BREAK-GLASS-REVIEW-READY"]},
+    "verdict_reason": {"type": "string"},
+    "exit_code": {"enum": [0, 10, 20, 30]},
+    "break_glass_review_ready": {"type": "boolean"},
+    "counts": {
+      "type": "object",
+      "required": ["pods", "pvcs", "pvs", "volumeattachments", "referencing_pods", "stateful_pods", "attached_volumeattachments", "unhealthy_nodes", "bound_pvs", "scan_errors", "warnings", "dangers", "blockers"],
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "dangers": {"type": "array", "items": {"type": "string"}},
+    "blockers": {"type": "array", "items": {"type": "string"}},
+    "chain": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "namespace", "name", "role", "status", "deletion_timestamp", "finalizers", "details"],
+        "properties": {
+          "kind": {"type": "string"},
+          "namespace": {"type": ["string", "null"]},
+          "name": {"type": "string"},
+          "role": {"type": "string"},
+          "status": {"type": "string"},
+          "deletion_timestamp": {"type": ["string", "null"]},
+          "finalizers": {"type": "array", "items": {"type": "string"}},
+          "details": {"type": "object"}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"verdict": {"const": "BREAK-GLASS-REVIEW-READY"}}},
+      "then": {
+        "properties": {
+          "command": {"const": "force-check"},
+          "exit_code": {"const": 30},
+          "break_glass_review_ready": {"const": true}
+        }
+      }
+    }
+  ]
+}
