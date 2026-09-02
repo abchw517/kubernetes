@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # pod-start-time-check.sh
-# Kubernetes Pod 启动耗时巡检工具
+# Kubernetes Pod Scheduled -> current Ready transition duration checker
+# v2.2.0 Production Hardening
 #
-# 启动耗时口径：Pod Ready condition.lastTransitionTime -
-#               PodScheduled condition.lastTransitionTime
+# Metric semantics:
+#   Ready=True condition.lastTransitionTime - PodScheduled.lastTransitionTime
 #
-# 功能：
-#   1. 默认扫描全集群所有命名空间；-n/--namespace 指定单命名空间
-#   2. Pod 启动耗时按降序输出
-#   3. 输出 Namespace / Deployment / Pod / 启动耗时
-#   4. >120s 黄色，>180s 红色（阈值可配置）
-#   5. >120s 的记录生成 HTML 报告并通过企业微信群机器人发送
-#   6. 日志、互斥锁、dry-run、异常清理、依赖检查
-#   7. RBAC 最小权限预检、kubectl API/命令双层超时
-#
-# 依赖：bash 4.0+、kubectl、jq、GNU date、GNU timeout、sort、flock
-#       启用企业微信发送时额外依赖 curl
+# IMPORTANT:
+#   This is a readiness-transition proxy. If readiness flaps after startup,
+#   Ready.lastTransitionTime is the latest transition to Ready=True, not the
+#   first-ever Ready timestamp.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -24,9 +18,9 @@ umask 077
 IFS=$'\n\t'
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
+readonly METRIC_NAME="scheduled_to_current_ready_transition_seconds"
 
-# ------------------------------- 默认配置 -------------------------------------
 NAMESPACE=""
 DRY_RUN=false
 WARN_SECONDS="${WARN_SECONDS:-120}"
@@ -36,7 +30,7 @@ KUBECTL_COMMAND_TIMEOUT="${KUBECTL_COMMAND_TIMEOUT:-45s}"
 
 LOG_DIR="${LOG_DIR:-/data/logs/pod-start-time-check}"
 REPORT_DIR="${REPORT_DIR:-${LOG_DIR}/reports}"
-LOCK_FILE="${LOCK_FILE:-/tmp/pod-start-time-check.lock}"
+LOCK_FILE="${LOCK_FILE:-/run/lock/pod-start-time-check/pod-start-time-check.lock}"
 WECHAT_WEBHOOK_URL="${WECHAT_WEBHOOK_URL:-}"
 
 LOG_FILE=""
@@ -45,7 +39,6 @@ RESULT_TSV=""
 SLOW_TSV=""
 REPORT_FILE=""
 
-# 统计信息
 TOTAL_PODS=0
 VALID_DEPLOYMENT_PODS=0
 SKIPPED_NO_READY=0
@@ -53,7 +46,6 @@ SKIPPED_NO_DEPLOYMENT=0
 WARN_COUNT=0
 CRITICAL_COUNT=0
 
-# 颜色
 readonly COLOR_RED=$'\033[31m'
 readonly COLOR_YELLOW=$'\033[33m'
 readonly COLOR_GREEN=$'\033[32m'
@@ -70,31 +62,20 @@ Options:
       --dry-run              只扫描和输出，不生成 HTML、不发送企业微信
       --warn-seconds <sec>   黄色告警阈值，默认 120
       --critical-seconds <s> 红色告警阈值，默认 180
-      --request-timeout <t>  Kubernetes API 单次请求超时，默认 30s
-      --command-timeout <t>  kubectl 整体命令超时，默认 45s
-      --webhook-url <url>    企业微信群机器人 Webhook；建议使用环境变量 WECHAT_WEBHOOK_URL
+      --request-timeout <t>  Kubernetes API 单次请求超时，默认 30s；禁止 0
+      --command-timeout <t>  kubectl 整体命令超时，默认 45s；禁止 0
+      --webhook-url <url>    企业微信群机器人 Webhook；生产建议使用 WECHAT_WEBHOOK_URL
       --log-dir <dir>        日志目录，默认 /data/logs/pod-start-time-check
       --report-dir <dir>     HTML 报告目录，默认 <log-dir>/reports
-      --lock-file <path>     锁文件，默认 /tmp/pod-start-time-check.lock
+      --lock-file <path>     锁文件，默认 /run/lock/pod-start-time-check/pod-start-time-check.lock
   -h, --help                 显示帮助
   -v, --version              显示版本
 
-Examples:
-  # 扫描全集群
-  ./pod-start-time-check.sh
+Metric:
+  scheduled_to_current_ready_transition_seconds =
+      Ready=True.lastTransitionTime - PodScheduled.lastTransitionTime
 
-  # 只扫描 pro-yunfan
-  ./pod-start-time-check.sh -n pro-yunfan
-
-  # Dry-run：只检查，不生成报告、不通知
-  ./pod-start-time-check.sh --dry-run
-
-  # 自定义阈值
-  ./pod-start-time-check.sh --warn-seconds 90 --critical-seconds 150
-
-  # 使用企业微信机器人
-  export WECHAT_WEBHOOK_URL='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REDACTED'
-  ./pod-start-time-check.sh
+  注意：这是当前 Ready transition 代理耗时，不保证等于 Pod 首次 Ready 启动耗时。
 USAGE
 }
 
@@ -105,7 +86,6 @@ log() {
     now="$(date '+%Y-%m-%d %H:%M:%S')"
     line="${now} ${SCRIPT_NAME} [${level}] $*"
 
-    # 日志文件初始化前，仅输出 stderr；初始化后同时落盘。
     if [[ -n "${LOG_FILE}" ]]; then
         printf '%s\n' "${line}" | tee -a "${LOG_FILE}" >&2
     else
@@ -118,8 +98,24 @@ fatal() {
     exit 1
 }
 
-is_positive_integer() {
+is_nonnegative_integer() {
     [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_zero_duration() {
+    local value="$1"
+    local stripped
+
+    stripped="${value//0/}"
+    stripped="${stripped//./}"
+    stripped="${stripped//ms/}"
+    stripped="${stripped//us/}"
+    stripped="${stripped//ns/}"
+    stripped="${stripped//s/}"
+    stripped="${stripped//m/}"
+    stripped="${stripped//h/}"
+
+    [[ -z "${stripped}" ]]
 }
 
 parse_args() {
@@ -157,7 +153,7 @@ parse_args() {
             --webhook-url)
                 (($# >= 2)) || fatal "$1 缺少 URL 参数"
                 WECHAT_WEBHOOK_URL="$2"
-                log "WARN" "--webhook-url 可能暴露在 shell history/进程参数中，生产环境建议使用 WECHAT_WEBHOOK_URL 环境变量"
+                log "WARN" "--webhook-url 可能暴露在 shell history/进程参数中，生产建议使用 WECHAT_WEBHOOK_URL"
                 shift 2
                 ;;
             --log-dir)
@@ -191,14 +187,41 @@ parse_args() {
 }
 
 validate_config() {
-    is_positive_integer "${WARN_SECONDS}" || fatal "--warn-seconds 必须是非负整数"
-    is_positive_integer "${CRITICAL_SECONDS}" || fatal "--critical-seconds 必须是非负整数"
-
+    is_nonnegative_integer "${WARN_SECONDS}" || fatal "--warn-seconds 必须是非负整数"
+    is_nonnegative_integer "${CRITICAL_SECONDS}" || fatal "--critical-seconds 必须是非负整数"
     (( CRITICAL_SECONDS > WARN_SECONDS )) || \
         fatal "critical 阈值必须大于 warn 阈值: warn=${WARN_SECONDS}, critical=${CRITICAL_SECONDS}"
 
     [[ -n "${KUBECTL_REQUEST_TIMEOUT}" ]] || fatal "--request-timeout 不能为空"
     [[ -n "${KUBECTL_COMMAND_TIMEOUT}" ]] || fatal "--command-timeout 不能为空"
+
+    is_zero_duration "${KUBECTL_REQUEST_TIMEOUT}" && \
+        fatal "--request-timeout 禁止为 0: ${KUBECTL_REQUEST_TIMEOUT}"
+    is_zero_duration "${KUBECTL_COMMAND_TIMEOUT}" && \
+        fatal "--command-timeout 禁止为 0: ${KUBECTL_COMMAND_TIMEOUT}"
+
+    return 0
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "缺少依赖命令: $1"
+}
+
+bootstrap_preflight() {
+    local cmd
+    for cmd in kubectl jq date sort flock awk sed mktemp timeout stat id mkdir chmod tee; do
+        require_cmd "${cmd}"
+    done
+
+    timeout "${KUBECTL_COMMAND_TIMEOUT}" true >/dev/null 2>&1 || \
+        fatal "--command-timeout 格式无效: ${KUBECTL_COMMAND_TIMEOUT}"
+
+    kubectl --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" version --client >/dev/null 2>&1 || \
+        fatal "kubectl client 不可用，或 --request-timeout 格式无效: ${KUBECTL_REQUEST_TIMEOUT}"
+
+    if [[ "${DRY_RUN}" == false && -n "${WECHAT_WEBHOOK_URL}" ]]; then
+        require_cmd curl
+    fi
 }
 
 init_runtime() {
@@ -218,7 +241,7 @@ cleanup() {
     if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
         rm -rf "${TMP_DIR}"
     fi
-    exit "${rc}"
+    return "${rc}"
 }
 
 on_error() {
@@ -228,12 +251,50 @@ on_error() {
     exit "${rc}"
 }
 
+validate_lock_path() {
+    local lock_dir mode owner uid group_digit other_digit
+
+    lock_dir="${LOCK_FILE%/*}"
+    [[ "${lock_dir}" != "${LOCK_FILE}" ]] || lock_dir="."
+
+    if [[ -L "${lock_dir}" ]]; then
+        fatal "锁目录不能是符号链接: ${lock_dir}"
+    fi
+
+    if [[ ! -d "${lock_dir}" ]]; then
+        mkdir -p -m 0700 "${lock_dir}" || fatal "无法创建安全锁目录: ${lock_dir}"
+    fi
+
+    [[ -d "${lock_dir}" && ! -L "${lock_dir}" ]] || \
+        fatal "锁目录不是安全目录: ${lock_dir}"
+
+    uid="$(id -u)"
+    owner="$(stat -c '%u' "${lock_dir}")" || fatal "无法读取锁目录 owner: ${lock_dir}"
+    [[ "${owner}" == "${uid}" ]] || \
+        fatal "锁目录 owner 与当前执行用户不一致: dir=${lock_dir}, owner=${owner}, uid=${uid}"
+
+    mode="$(stat -c '%a' "${lock_dir}")" || fatal "无法读取锁目录权限: ${lock_dir}"
+    group_digit="${mode: -2:1}"
+    other_digit="${mode: -1}"
+    if (( (10#${group_digit} & 2) != 0 || (10#${other_digit} & 2) != 0 )); then
+        fatal "锁目录不能 group/world writable: dir=${lock_dir}, mode=${mode}"
+    fi
+
+    if [[ -e "${LOCK_FILE}" || -L "${LOCK_FILE}" ]]; then
+        [[ -f "${LOCK_FILE}" && ! -L "${LOCK_FILE}" ]] || \
+            fatal "锁文件必须是普通文件且不能是符号链接: ${LOCK_FILE}"
+        owner="$(stat -c '%u' "${LOCK_FILE}")" || fatal "无法读取锁文件 owner: ${LOCK_FILE}"
+        [[ "${owner}" == "${uid}" ]] || \
+            fatal "锁文件 owner 与当前执行用户不一致: file=${LOCK_FILE}, owner=${owner}, uid=${uid}"
+    fi
+}
+
 acquire_lock() {
-    local lock_dir
-    lock_dir="$(dirname "${LOCK_FILE}")"
-    mkdir -p "${lock_dir}" || fatal "无法创建锁目录: ${lock_dir}"
+    validate_lock_path
 
     exec {LOCK_FD}>"${LOCK_FILE}"
+    chmod 0600 "${LOCK_FILE}" || fatal "无法设置锁文件权限: ${LOCK_FILE}"
+
     if ! flock -n "${LOCK_FD}"; then
         fatal "已有实例正在运行，锁文件: ${LOCK_FILE}"
     fi
@@ -242,13 +303,6 @@ acquire_lock() {
     log "INFO" "获取运行锁成功: ${LOCK_FILE}, pid=$$"
 }
 
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || fatal "缺少依赖命令: $1"
-}
-
-# 所有访问 Kubernetes API 的 kubectl 命令统一经过双层超时保护。
-# 第一层：kubectl --request-timeout，限制单次 API Server 请求。
-# 第二层：GNU timeout，限制整个 kubectl 进程的最大执行时间。
 kubectl_safe() {
     local rc=0
     local action="${1:-unknown}"
@@ -268,12 +322,36 @@ kubectl_safe() {
     return "${rc}"
 }
 
-# RBAC 最小权限预检。
-# 脚本只需要：pods:list、replicasets.apps:list。
-# 不读取 Namespace 对象，不需要 namespaces:get。
+can_i_value() {
+    local output
+    output="$(kubectl_safe auth can-i "$@" 2>/dev/null)" || return 2
+    case "${output}" in
+        yes|no) printf '%s' "${output}" ;;
+        *) return 2 ;;
+    esac
+}
+
+require_rbac_permission() {
+    local description="$1"
+    shift
+    local answer
+
+    answer="$(can_i_value "$@")" || fatal "RBAC 检查失败：无法验证 ${description}"
+    [[ "${answer}" == "yes" ]] || fatal "RBAC 权限不足：需要 ${description}"
+}
+
+forbid_rbac_permission() {
+    local description="$1"
+    shift
+    local answer
+
+    answer="$(can_i_value "$@")" || fatal "Strict RBAC 检查失败：无法验证 ${description}"
+    [[ "${answer}" == "no" ]] || \
+        fatal "Strict RBAC 拒绝高权限身份：检测到 ${description}；请使用 pod-start-time-check 专用最小权限身份"
+}
+
 check_rbac_permissions() {
     local -a auth_scope=()
-    local pods_can_i rs_can_i
 
     if [[ -n "${NAMESPACE}" ]]; then
         auth_scope=(-n "${NAMESPACE}")
@@ -281,43 +359,22 @@ check_rbac_permissions() {
         auth_scope=(--all-namespaces)
     fi
 
-    if ! pods_can_i="$(kubectl_safe auth can-i list pods "${auth_scope[@]}" 2>/dev/null)"; then
-        fatal "RBAC 检查失败：无法验证 pods:list 权限，范围=${NAMESPACE:-ALL_NAMESPACES}"
-    fi
-    [[ "${pods_can_i}" == "yes" ]] || \
-        fatal "RBAC 权限不足：需要 pods:list，范围=${NAMESPACE:-ALL_NAMESPACES}"
+    require_rbac_permission "pods:list" list pods "${auth_scope[@]}"
+    require_rbac_permission "replicasets.apps:list" list replicasets.apps "${auth_scope[@]}"
 
-    if ! rs_can_i="$(kubectl_safe auth can-i list replicasets.apps "${auth_scope[@]}" 2>/dev/null)"; then
-        fatal "RBAC 检查失败：无法验证 replicasets.apps:list 权限，范围=${NAMESPACE:-ALL_NAMESPACES}"
-    fi
-    [[ "${rs_can_i}" == "yes" ]] || \
-        fatal "RBAC 权限不足：需要 replicasets.apps:list，范围=${NAMESPACE:-ALL_NAMESPACES}"
+    forbid_rbac_permission "wildcard */*" '*' '*' "${auth_scope[@]}"
+    forbid_rbac_permission "secrets:get" get secrets "${auth_scope[@]}"
+    forbid_rbac_permission "pods:delete" delete pods "${auth_scope[@]}"
+    forbid_rbac_permission "deployments.apps:patch" patch deployments.apps "${auth_scope[@]}"
+    forbid_rbac_permission \
+        "clusterrolebindings.rbac.authorization.k8s.io:create" \
+        create clusterrolebindings.rbac.authorization.k8s.io
 
-    log "INFO" "RBAC 最小权限检查通过: pods:list, replicasets.apps:list, scope=${NAMESPACE:-ALL_NAMESPACES}"
+    log "INFO" "Strict RBAC 检查通过: required=pods:list,replicasets:list; dangerous permissions=none"
 }
 
 preflight() {
-    local cmd
-    for cmd in kubectl jq date sort flock awk sed mktemp timeout; do
-        require_cmd "${cmd}"
-    done
-
-    # date -d 是 GNU date 能力，必须验证。
-    date -d '2026-01-01T00:00:00Z' '+%s' >/dev/null 2>&1 || \
-        fatal "当前 date 不支持 -d RFC3339 时间解析，需要 GNU coreutils date"
-
-    if [[ "${DRY_RUN}" == false && -n "${WECHAT_WEBHOOK_URL}" ]]; then
-        require_cmd curl
-    fi
-
-    timeout "${KUBECTL_COMMAND_TIMEOUT}" true >/dev/null 2>&1 || \
-        fatal "--command-timeout 格式无效: ${KUBECTL_COMMAND_TIMEOUT}"
-
-    kubectl --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" version --client >/dev/null 2>&1 || \
-        fatal "kubectl client 不可用，或 --request-timeout 格式无效: ${KUBECTL_REQUEST_TIMEOUT}"
-
     check_rbac_permissions
-
     log "INFO" "预检查通过: request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}"
 }
 
@@ -345,6 +402,9 @@ fetch_cluster_data() {
 
     kubectl_safe get replicasets.apps "${scope_args[@]}" -o json > "${rs_json}" || \
         fatal "获取 ReplicaSet 数据失败（可能是 RBAC、Namespace 不存在、API 请求超时或集群连接异常）"
+
+    jq -e '.items | type == "array"' "${pod_json}" >/dev/null || fatal "Pod API 返回 JSON 结构异常"
+    jq -e '.items | type == "array"' "${rs_json}" >/dev/null || fatal "ReplicaSet API 返回 JSON 结构异常"
 
     TOTAL_PODS="$(jq '.items | length' "${pod_json}")"
     log "INFO" "集群数据拉取完成: pods=${TOTAL_PODS}, replicasets=$(jq '.items | length' "${rs_json}")"
@@ -379,6 +439,11 @@ extract_pod_records() {
     local pods_tsv="${TMP_DIR}/pods.tsv"
 
     jq -r '
+      def epoch_or_null:
+        if . == "" or . == null then null
+        else try fromdateiso8601 catch null
+        end;
+
       .items[]
       | .metadata.namespace as $ns
       | .metadata.name as $pod
@@ -391,14 +456,27 @@ extract_pod_records() {
       | ((.status.conditions // [])
           | map(select(.type == "Ready" and .status == "True"))
           | .[0].lastTransitionTime // "") as $ready
-      | [$ns, $pod, ($owner.kind // ""), ($owner.name // ""), $scheduled, $ready]
+      | ($scheduled | epoch_or_null) as $scheduled_epoch
+      | ($ready | epoch_or_null) as $ready_epoch
+      | (if ($scheduled_epoch != null and $ready_epoch != null)
+           then ($ready_epoch - $scheduled_epoch)
+           else null
+         end) as $duration
+      | [
+          $ns,
+          $pod,
+          ($owner.kind // ""),
+          ($owner.name // ""),
+          $scheduled,
+          $ready,
+          (if $duration == null then "" else ($duration | tostring) end)
+        ]
       | @tsv
     ' "${pod_json}" > "${pods_tsv}"
 
-    local ns pod owner_kind owner_name scheduled ready deployment
-    local scheduled_epoch ready_epoch load_seconds
+    local ns pod owner_kind owner_name scheduled ready duration deployment
 
-    while IFS=$'\t' read -r ns pod owner_kind owner_name scheduled ready; do
+    while IFS=$'\t' read -r ns pod owner_kind owner_name scheduled ready duration; do
         deployment=""
 
         case "${owner_kind}" in
@@ -406,11 +484,9 @@ extract_pod_records() {
                 deployment="${RS_TO_DEPLOYMENT["${ns}/${owner_name}"]:-}"
                 ;;
             Deployment)
-                # 理论上 Pod 通常由 ReplicaSet 控制，这里兼容直接 Deployment owner 的异常/特殊场景。
                 deployment="${owner_name}"
                 ;;
             *)
-                deployment=""
                 ;;
         esac
 
@@ -421,31 +497,19 @@ extract_pod_records() {
 
         ((VALID_DEPLOYMENT_PODS+=1))
 
-        if [[ -z "${scheduled}" || -z "${ready}" ]]; then
+        if [[ -z "${duration}" || ! "${duration}" =~ ^-?[0-9]+$ ]]; then
             ((SKIPPED_NO_READY+=1))
             continue
         fi
 
-        if ! scheduled_epoch="$(date -d "${scheduled}" '+%s' 2>/dev/null)"; then
-            log "WARN" "无法解析 PodScheduled 时间，跳过: ${ns}/${pod}, value=${scheduled}"
+        if (( duration < 0 )); then
+            log "WARN" "Ready transition 代理耗时为负数，跳过: ${ns}/${pod}, scheduled=${scheduled}, ready=${ready}"
             ((SKIPPED_NO_READY+=1))
-            continue
-        fi
-
-        if ! ready_epoch="$(date -d "${ready}" '+%s' 2>/dev/null)"; then
-            log "WARN" "无法解析 Ready 时间，跳过: ${ns}/${pod}, value=${ready}"
-            ((SKIPPED_NO_READY+=1))
-            continue
-        fi
-
-        load_seconds=$((ready_epoch - scheduled_epoch))
-        if (( load_seconds < 0 )); then
-            log "WARN" "启动耗时为负数，跳过: ${ns}/${pod}, scheduled=${scheduled}, ready=${ready}"
             continue
         fi
 
         printf '%s\t%s\t%s\t%d\n' \
-            "${ns}" "${deployment}" "${pod}" "${load_seconds}" >> "${RESULT_TSV}"
+            "${ns}" "${deployment}" "${pod}" "${duration}" >> "${RESULT_TSV}"
     done < "${pods_tsv}"
 
     sort -t $'\t' -k4,4nr -k1,1 -k2,2 -k3,3 "${RESULT_TSV}" -o "${RESULT_TSV}"
@@ -461,16 +525,16 @@ extract_pod_records() {
 print_results() {
     local ns deployment pod seconds color
 
-    printf '\n%sPod 启动耗时巡检结果%s\n' "${COLOR_CYAN}" "${COLOR_RESET}"
-    printf '%-28s %-48s %-70s %12s\n' "NAMESPACE" "DEPLOYMENT" "POD" "STARTUP(s)"
-    printf '%-28s %-48s %-70s %12s\n' \
+    printf '\n%sPod Scheduled -> 当前 Ready transition 代理耗时%s\n' "${COLOR_CYAN}" "${COLOR_RESET}"
+    printf '%-28s %-48s %-70s %16s\n' "NAMESPACE" "DEPLOYMENT" "POD" "TRANSITION(s)"
+    printf '%-28s %-48s %-70s %16s\n' \
         '----------------------------' \
         '------------------------------------------------' \
         '----------------------------------------------------------------------' \
-        '------------'
+        '----------------'
 
     if [[ ! -s "${RESULT_TSV}" ]]; then
-        printf '%s未发现可计算启动耗时的 Deployment Pod%s\n' "${COLOR_GREEN}" "${COLOR_RESET}"
+        printf '%s未发现可计算代理耗时的 Deployment Pod%s\n' "${COLOR_GREEN}" "${COLOR_RESET}"
         return 0
     fi
 
@@ -483,32 +547,26 @@ print_results() {
         fi
 
         if [[ -n "${color}" ]]; then
-            printf '%b%-28s %-48s %-70s %12ss%b\n' \
+            printf '%b%-28s %-48s %-70s %16ss%b\n' \
                 "${color}" "${ns}" "${deployment}" "${pod}" "${seconds}" "${COLOR_RESET}"
         else
-            printf '%-28s %-48s %-70s %12ss\n' \
+            printf '%-28s %-48s %-70s %16ss\n' \
                 "${ns}" "${deployment}" "${pod}" "${seconds}"
         fi
     done < "${RESULT_TSV}"
 
-    printf '\n统计: total_pods=%s, deployment_pods=%s, no_ready=%s, non_deployment=%s, >%ss=%s, >%ss=%s\n' \
+    printf '\n统计: total_pods=%s, deployment_pods=%s, no_ready_or_invalid_time=%s, non_deployment=%s, >%ss=%s, >%ss=%s\n' \
         "${TOTAL_PODS}" "${VALID_DEPLOYMENT_PODS}" "${SKIPPED_NO_READY}" \
         "${SKIPPED_NO_DEPLOYMENT}" "${WARN_SECONDS}" "$((WARN_COUNT + CRITICAL_COUNT))" \
         "${CRITICAL_SECONDS}" "${CRITICAL_COUNT}"
 }
 
 html_escape() {
-    local s="$1"
-    s=${s//&/&amp;}
-    s=${s//</&lt;}
-    s=${s//>/&gt;}
-    s=${s//\"/&quot;}
-    s=${s//\'/&#39;}
-    printf '%s' "${s}"
+    jq -nr --arg value "$1" '$value | @html'
 }
 
 generate_html_report() {
-    local slow_total
+    local slow_total scope generated_at
     slow_total=$((WARN_COUNT + CRITICAL_COUNT))
 
     (( slow_total > 0 )) || {
@@ -518,8 +576,6 @@ generate_html_report() {
 
     mkdir -p "${REPORT_DIR}" || fatal "无法创建报告目录: ${REPORT_DIR}"
     REPORT_FILE="${REPORT_DIR}/pod-start-time-report-$(date '+%Y%m%d-%H%M%S').html"
-
-    local scope generated_at
     scope="${NAMESPACE:-ALL_NAMESPACES}"
     generated_at="$(date '+%Y-%m-%d %H:%M:%S %z')"
 
@@ -529,7 +585,7 @@ generate_html_report() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kubernetes Pod 启动耗时巡检报告</title>
+<title>Kubernetes Pod Ready Transition 巡检报告</title>
 <style>
 body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; margin: 24px; color: #222; }
 h1 { margin-bottom: 8px; }
@@ -545,11 +601,13 @@ th { background: #f0f2f5; }
 </style>
 </head>
 <body>
-<h1>Kubernetes Pod 启动耗时巡检报告</h1>
+<h1>Kubernetes Pod Ready Transition 巡检报告</h1>
 <div class="meta">
   <div><strong>扫描范围：</strong>$(html_escape "${scope}")</div>
   <div><strong>生成时间：</strong>$(html_escape "${generated_at}")</div>
-  <div><strong>计算口径：</strong>Ready.lastTransitionTime - PodScheduled.lastTransitionTime</div>
+  <div><strong>指标：</strong>$(html_escape "${METRIC_NAME}")</div>
+  <div><strong>计算口径：</strong>Ready=True.lastTransitionTime - PodScheduled.lastTransitionTime</div>
+  <div><strong>语义说明：</strong>这是当前 Ready transition 的代理耗时；Readiness 后续抖动会刷新该时间，不等价于历史首次 Ready。</div>
   <div><strong>阈值：</strong>&gt; ${WARN_SECONDS}s 警告，&gt; ${CRITICAL_SECONDS}s 严重</div>
 </div>
 <div class="summary">
@@ -558,7 +616,7 @@ th { background: #f0f2f5; }
 </div>
 <table>
 <thead>
-<tr><th>Namespace</th><th>Deployment</th><th>Pod</th><th>启动耗时</th><th>级别</th></tr>
+<tr><th>Namespace</th><th>Deployment</th><th>Pod</th><th>代理耗时</th><th>级别</th></tr>
 </thead>
 <tbody>
 EOF_HTML
@@ -585,7 +643,7 @@ EOF_HTML
     cat >> "${REPORT_FILE}" <<'EOF_HTML'
 </tbody>
 </table>
-<div class="footer">Generated by pod-start-time-check.sh v2.1.0</div>
+<div class="footer">Generated by pod-start-time-check.sh v2.2.0</div>
 </body>
 </html>
 EOF_HTML
@@ -619,8 +677,6 @@ wechat_post_json() {
         log "ERROR" "企业微信发送失败: errcode=${errcode}, errmsg=${errmsg}"
         return 1
     fi
-
-    return 0
 }
 
 wechat_send_markdown_summary() {
@@ -630,6 +686,7 @@ wechat_send_markdown_summary() {
 
     payload="$(jq -nc \
         --arg scope "${scope}" \
+        --arg metric "${METRIC_NAME}" \
         --argjson warn_seconds "${WARN_SECONDS}" \
         --argjson critical_seconds "${CRITICAL_SECONDS}" \
         --argjson slow_total "${slow_total}" \
@@ -638,11 +695,12 @@ wechat_send_markdown_summary() {
           msgtype: "markdown",
           markdown: {
             content: (
-              "### Kubernetes Pod 启动耗时巡检\\n" +
+              "### Kubernetes Pod Ready Transition 巡检\\n" +
               "> 扫描范围：`" + $scope + "`\\n" +
+              "> 指标：`" + $metric + "`\\n" +
               "> 超过 " + ($warn_seconds|tostring) + "s：<font color=\"warning\">" + ($slow_total|tostring) + "</font>\\n" +
               "> 超过 " + ($critical_seconds|tostring) + "s：<font color=\"warning\">" + ($critical_total|tostring) + "</font>\\n" +
-              "> 详细数据见随后的 HTML 报告文件。"
+              "> 该指标是当前 Ready transition 代理耗时，不保证等于历史首次 Ready。"
             )
           }
         }')"
@@ -696,7 +754,7 @@ send_wechat_report() {
     (( slow_total > 0 )) || return 0
 
     if [[ -z "${WECHAT_WEBHOOK_URL}" ]]; then
-        log "WARN" "检测到 ${slow_total} 个慢启动 Pod，但未配置 WECHAT_WEBHOOK_URL；仅保留 HTML 报告"
+        log "WARN" "检测到 ${slow_total} 个慢启动代理指标 Pod，但未配置 WECHAT_WEBHOOK_URL；仅保留 HTML 报告"
         return 0
     fi
 
@@ -715,6 +773,7 @@ send_wechat_report() {
 main() {
     parse_args "$@"
     validate_config
+    bootstrap_preflight
     init_runtime
 
     trap cleanup EXIT
@@ -724,7 +783,7 @@ main() {
     acquire_lock
     preflight
 
-    log "INFO" "开始巡检: namespace=${NAMESPACE:-ALL_NAMESPACES}, warn=${WARN_SECONDS}s, critical=${CRITICAL_SECONDS}s, request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}, dry_run=${DRY_RUN}"
+    log "INFO" "开始巡检: metric=${METRIC_NAME}, namespace=${NAMESPACE:-ALL_NAMESPACES}, warn=${WARN_SECONDS}s, critical=${CRITICAL_SECONDS}s, request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}, dry_run=${DRY_RUN}"
 
     fetch_cluster_data
     build_deployment_map
