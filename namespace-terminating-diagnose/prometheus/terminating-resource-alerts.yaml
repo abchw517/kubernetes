@@ -1,0 +1,117 @@
+# Kubernetes Terminating Resource Alerts
+#
+# Dependencies:
+#   - kube-state-metrics
+#   - Pod/PVC/PV deletion timestamp metrics
+#   - VolumeAttachment metrics enabled
+#
+# Notes:
+#   - Pod/PVC/PV alerts use deletionTimestamp age directly.
+#   - kube-state-metrics currently exposes VolumeAttachment attached/info/created
+#     but no VolumeAttachment deletionTimestamp metric, so VolumeAttachment uses
+#     "attached to NotReady node" as the production-risk signal.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubernetes-terminating-resource-governance
+  labels:
+    app.kubernetes.io/name: namespace-terminating-diagnose
+    app.kubernetes.io/component: resource-terminating
+spec:
+  groups:
+    - name: kubernetes.terminating-resource.rules
+      interval: 30s
+      rules:
+        - record: kubernetes:pod_terminating_age_seconds
+          expr: |
+            time() - kube_pod_deletion_timestamp
+
+        - record: kubernetes:pvc_terminating_age_seconds
+          expr: |
+            time() - kube_persistentvolumeclaim_deletion_timestamp
+
+        - record: kubernetes:pv_terminating_age_seconds
+          expr: |
+            time() - kube_persistentvolume_deletion_timestamp
+
+        - alert: KubernetesPodStuckTerminating
+          expr: |
+            kubernetes:pod_terminating_age_seconds > 600
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} 长时间 Terminating"
+            description: >-
+              Pod deletionTimestamp 已超过 10 分钟。优先检查 terminationGracePeriodSeconds、
+              PreStop、kubelet/containerd、Node Ready、Finalizer、PVC 与 CSI 卸载链路。
+              可运行 terminating-diagnose.sh diagnose pod 进行关联诊断。
+
+        - alert: KubernetesPVCStuckTerminating
+          expr: |
+            kubernetes:pvc_terminating_age_seconds > 600
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} 长时间 Terminating"
+            description: >-
+              PVC deletionTimestamp 已超过 10 分钟。重点检查是否仍被 Pod 引用、
+              kubernetes.io/pvc-protection、关联 PV 与 VolumeAttachment。
+              不要直接移除 pvc-protection finalizer。
+
+        - alert: KubernetesPVStuckTerminating
+          expr: |
+            kubernetes:pv_terminating_age_seconds > 600
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PV {{ $labels.persistentvolume }} 长时间 Terminating"
+            description: >-
+              PV deletionTimestamp 已超过 10 分钟。重点检查 claimRef、reclaimPolicy、
+              external-provisioner finalizer、CSI DeleteVolume、VolumeAttachment 与真实存储后端。
+              对 reclaimPolicy=Delete 的 PV，禁止在未核验后端卷状态时强制清 Finalizer。
+
+        - alert: KubernetesVolumeAttachmentAttachedToNotReadyNode
+          expr: |
+            (
+              kube_volumeattachment_status_attached == 1
+            )
+            * on(volumeattachment) group_left(node, attacher)
+              kube_volumeattachment_info
+            * on(node) group_left()
+              (
+                kube_node_status_condition{
+                  condition="Ready",
+                  status="true"
+                } == 0
+              )
+            > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "VolumeAttachment {{ $labels.volumeattachment }} 持续挂在 NotReady Node"
+            description: >-
+              VolumeAttachment 已连续至少 10 分钟 attached=true，且目标 Node={{ $labels.node }}
+              不是 Ready。请确认节点是网络分区、kubelet 故障还是永久关机，并检查 CSI
+              ControllerUnpublishVolume/Detach；StatefulSet/RWO 场景需先完成 fencing，
+              不要直接删除 VolumeAttachment。
+
+        - alert: ResourceTerminatingDiagnosisStale
+          expr: |
+            resource_terminating_diagnose_generated_timestamp_seconds > 0
+            and
+            (
+              time() - resource_terminating_diagnose_generated_timestamp_seconds
+            ) > 3600
+          for: 5m
+          labels:
+            severity: info
+          annotations:
+            summary: "Terminating 资源诊断结果超过 1 小时未刷新"
+            description: >-
+              {{ $labels.kind }} {{ $labels.namespace }}/{{ $labels.name }}
+              的 resource-terminating-diagnose textfile 指标已超过 1 小时未刷新。
+              如果故障仍在处理中，请重新执行 diagnose/report。
