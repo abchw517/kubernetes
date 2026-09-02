@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+while [[ $# -gt 0 && "$1" == --request-timeout=* ]]; do shift; done
+
+case "${1:-}" in
+  version)
+    exit 0
+    ;;
+  auth)
+    [[ "${2:-}" == "can-i" ]] || exit 2
+    verb="${3:-}"
+    resource="${4:-}"
+    if [[ "${MOCK_RBAC_ERROR:-0}" == "1" ]]; then exit 1; fi
+    if [[ "${MOCK_PRIVILEGED:-0}" == "1" && "$verb" == "*" && "$resource" == "*" ]]; then
+      echo yes
+      exit 0
+    fi
+    case "${verb}:${resource}" in
+      list:pods|list:replicasets.apps) echo yes ;;
+      *) echo no ;;
+    esac
+    ;;
+  get)
+    case "${2:-}" in
+      pods) cat "${MOCK_FIXTURE_DIR}/pods.json" ;;
+      replicasets.apps) cat "${MOCK_FIXTURE_DIR}/replicasets.json" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *)
+    exit 2
+    ;;
+esac
