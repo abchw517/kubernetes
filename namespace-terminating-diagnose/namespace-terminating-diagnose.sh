@@ -4,7 +4,7 @@
 #
 # Kubernetes Namespace Terminating 生产级只读诊断 CLI
 #
-# v2.0.0
+# v2.1.0
 #
 # 子命令：
 #   check       轻量检查；支持 --all-terminating 作为集群巡检入口
@@ -27,7 +27,7 @@
 
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 COMMAND=""
 NAMESPACE=""
