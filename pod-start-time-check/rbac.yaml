@@ -1,12 +1,11 @@
-# pod-start-time-check v2.2.0
-# Production RBAC baseline: read-only and intentionally minimal.
-# Required permissions:
+# pod-start-time-check v2.3.0
+# Identity Hardening RBAC baseline: read-only and intentionally minimal.
+# Runtime permissions:
 #   - core/pods: list
 #   - apps/replicasets: list
 #
-# v2.2.0 Strict RBAC preflight also rejects obvious over-privileged identities
-# such as wildcard */*, secrets:get, pods:delete, deployments:patch and
-# clusterrolebindings:create.
+# The ServiceAccount disables automatic token mounting because v2.3.0 external
+# runtime uses an explicitly provisioned dedicated kubeconfig.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -22,6 +21,7 @@ metadata:
   namespace: pod-start-time-check-system
   labels:
     app.kubernetes.io/name: pod-start-time-check
+automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
