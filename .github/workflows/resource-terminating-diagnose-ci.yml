@@ -1,0 +1,86 @@
+name: Resource Terminating Diagnose Gate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'resource-terminating-diagnose/**'
+      - '.github/workflows/resource-terminating-diagnose-ci.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'resource-terminating-diagnose/**'
+      - '.github/workflows/resource-terminating-diagnose-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: resource-terminating-diagnose-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-and-contract:
+    name: Read-only, shell and mock contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq shellcheck
+
+      - name: Validate Bash syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            echo "bash -n: ${file}"
+            bash -n "${file}"
+          done < <(
+            find resource-terminating-diagnose \
+              -type f -name '*.sh' -print0
+          )
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(
+            find resource-terminating-diagnose \
+              -type f -name '*.sh' -print0
+          )
+          shellcheck --severity=error "${files[@]}"
+
+      - name: Enforce read-only contract
+        shell: bash
+        run: |
+          bash resource-terminating-diagnose/tests/validate-readonly.sh
+
+      - name: Run mock behavior contracts
+        shell: bash
+        run: |
+          bash resource-terminating-diagnose/tests/smoke.sh
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
