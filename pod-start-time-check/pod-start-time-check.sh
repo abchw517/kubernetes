@@ -2,15 +2,15 @@
 # ==============================================================================
 # pod-start-time-check.sh
 # Kubernetes Pod Scheduled -> current Ready transition duration checker
-# v2.2.1 Production Maintenance
+# v2.3.0 Identity Hardening
+#
+# Runtime identity:
+#   All Kubernetes API calls MUST use KUBECONFIG_FILE.
+#   Default: /data/pod-start-time-check/kubeconfig
+#   There is no fallback to $KUBECONFIG or ~/.kube/config.
 #
 # Metric semantics:
 #   Ready=True condition.lastTransitionTime - PodScheduled.lastTransitionTime
-#
-# IMPORTANT:
-#   This is a readiness-transition proxy. If readiness flaps after startup,
-#   Ready.lastTransitionTime is the latest transition to Ready=True, not the
-#   first-ever Ready timestamp.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -18,7 +18,7 @@ umask 077
 IFS=$'\n\t'
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.2.1"
+readonly SCRIPT_VERSION="2.3.0"
 readonly METRIC_NAME="scheduled_to_current_ready_transition_seconds"
 
 NAMESPACE=""
@@ -27,6 +27,7 @@ WARN_SECONDS="${WARN_SECONDS:-120}"
 CRITICAL_SECONDS="${CRITICAL_SECONDS:-180}"
 KUBECTL_REQUEST_TIMEOUT="${KUBECTL_REQUEST_TIMEOUT:-30s}"
 KUBECTL_COMMAND_TIMEOUT="${KUBECTL_COMMAND_TIMEOUT:-45s}"
+KUBECONFIG_FILE="${KUBECONFIG_FILE:-/data/pod-start-time-check/kubeconfig}"
 
 LOG_DIR="${LOG_DIR:-/data/logs/pod-start-time-check}"
 REPORT_DIR="${REPORT_DIR:-}"
@@ -72,9 +73,13 @@ Options:
   -h, --help                 显示帮助
   -v, --version              显示版本
 
+Identity:
+  运行时 kubeconfig 仅通过 KUBECONFIG_FILE 环境变量配置。
+  默认: /data/pod-start-time-check/kubeconfig
+  不存在、不安全或权限错误时 Fail Closed；绝不回退到 $KUBECONFIG 或 ~/.kube/config。
+
 WeCom:
-  仅通过环境变量 WECHAT_WEBHOOK_URL 配置机器人 Webhook，避免 Secret 暴露在
-  shell history 和进程参数中。
+  仅通过环境变量 WECHAT_WEBHOOK_URL 配置机器人 Webhook。
 
 Metric:
   scheduled_to_current_ready_transition_seconds =
@@ -156,7 +161,7 @@ parse_args() {
                 shift 2
                 ;;
             --webhook-url)
-                fatal "--webhook-url 已移除；请通过 WECHAT_WEBHOOK_URL 环境变量配置，避免 Secret 暴露在命令行"
+                fatal "--webhook-url 已移除；请通过 WECHAT_WEBHOOK_URL 环境变量配置"
                 ;;
             --log-dir)
                 (($# >= 2)) || fatal "$1 缺少目录参数"
@@ -203,11 +208,14 @@ validate_config() {
 
     [[ -n "${KUBECTL_REQUEST_TIMEOUT}" ]] || fatal "--request-timeout 不能为空"
     [[ -n "${KUBECTL_COMMAND_TIMEOUT}" ]] || fatal "--command-timeout 不能为空"
-
     is_zero_duration "${KUBECTL_REQUEST_TIMEOUT}" && \
         fatal "--request-timeout 禁止为 0: ${KUBECTL_REQUEST_TIMEOUT}"
     is_zero_duration "${KUBECTL_COMMAND_TIMEOUT}" && \
         fatal "--command-timeout 禁止为 0: ${KUBECTL_COMMAND_TIMEOUT}"
+
+    [[ -n "${KUBECONFIG_FILE}" ]] || fatal "KUBECONFIG_FILE 不能为空"
+    [[ "${KUBECONFIG_FILE}" == /* ]] || \
+        fatal "KUBECONFIG_FILE 必须使用绝对路径: ${KUBECONFIG_FILE}"
 
     return 0
 }
@@ -216,17 +224,56 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || fatal "缺少依赖命令: $1"
 }
 
+validate_kubeconfig_file() {
+    local dir uid owner mode dir_mode group_digit other_digit
+
+    [[ -e "${KUBECONFIG_FILE}" || -L "${KUBECONFIG_FILE}" ]] || \
+        fatal "专用 kubeconfig 不存在: ${KUBECONFIG_FILE}；禁止回退到默认 kubeconfig"
+    [[ -f "${KUBECONFIG_FILE}" && ! -L "${KUBECONFIG_FILE}" ]] || \
+        fatal "专用 kubeconfig 必须是普通文件且不能是符号链接: ${KUBECONFIG_FILE}"
+    [[ -r "${KUBECONFIG_FILE}" ]] || fatal "专用 kubeconfig 不可读: ${KUBECONFIG_FILE}"
+
+    uid="$(id -u)"
+    owner="$(stat -c '%u' "${KUBECONFIG_FILE}")" || fatal "无法读取 kubeconfig owner"
+    [[ "${owner}" == "${uid}" ]] || \
+        fatal "专用 kubeconfig owner 与当前执行用户不一致: owner=${owner}, uid=${uid}"
+
+    mode="$(stat -c '%a' "${KUBECONFIG_FILE}")" || fatal "无法读取 kubeconfig 权限"
+    case "${mode: -3}" in
+        400|600) ;;
+        *) fatal "专用 kubeconfig 权限必须为 0400 或 0600: file=${KUBECONFIG_FILE}, mode=${mode}" ;;
+    esac
+
+    dir="$(dirname -- "${KUBECONFIG_FILE}")"
+    [[ -d "${dir}" && ! -L "${dir}" ]] || \
+        fatal "kubeconfig 所在目录必须是真实目录且不能是符号链接: ${dir}"
+
+    dir_mode="$(stat -c '%a' "${dir}")" || fatal "无法读取 kubeconfig 目录权限: ${dir}"
+    group_digit="${dir_mode: -2:1}"
+    other_digit="${dir_mode: -1}"
+    if (( (10#${group_digit} & 2) != 0 || (10#${other_digit} & 2) != 0 )); then
+        fatal "kubeconfig 目录不能 group/world writable: dir=${dir}, mode=${dir_mode}"
+    fi
+
+    log "INFO" "专用 kubeconfig 安全检查通过: ${KUBECONFIG_FILE}, mode=${mode}, uid=${uid}"
+}
+
 bootstrap_preflight() {
     local cmd
-    for cmd in kubectl jq date sort flock awk sed mktemp timeout stat id mkdir chmod tee; do
+    for cmd in kubectl jq date sort flock awk sed mktemp timeout stat id mkdir chmod tee dirname touch rm; do
         require_cmd "${cmd}"
     done
+
+    validate_kubeconfig_file
 
     timeout "${KUBECTL_COMMAND_TIMEOUT}" true >/dev/null 2>&1 || \
         fatal "--command-timeout 格式无效: ${KUBECTL_COMMAND_TIMEOUT}"
 
-    kubectl --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" version --client >/dev/null 2>&1 || \
-        fatal "kubectl client 不可用，或 --request-timeout 格式无效: ${KUBECTL_REQUEST_TIMEOUT}"
+    kubectl \
+        --kubeconfig="${KUBECONFIG_FILE}" \
+        --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" \
+        version --client >/dev/null 2>&1 || \
+        fatal "kubectl client 不可用、kubeconfig 无法解析或 timeout 格式无效"
 
     if [[ "${DRY_RUN}" == false && -n "${WECHAT_WEBHOOK_URL}" ]]; then
         require_cmd curl
@@ -263,17 +310,14 @@ on_error() {
 validate_lock_path() {
     local lock_dir mode owner uid group_digit other_digit
 
-    lock_dir="${LOCK_FILE%/*}"
-    [[ "${lock_dir}" != "${LOCK_FILE}" ]] || lock_dir="."
-
+    lock_dir="$(dirname -- "${LOCK_FILE}")"
     [[ ! -L "${lock_dir}" ]] || fatal "锁目录不能是符号链接: ${lock_dir}"
 
     if [[ ! -d "${lock_dir}" ]]; then
         mkdir -p -m 0700 "${lock_dir}" || fatal "无法创建安全锁目录: ${lock_dir}"
     fi
 
-    [[ -d "${lock_dir}" && ! -L "${lock_dir}" ]] || \
-        fatal "锁目录不是安全目录: ${lock_dir}"
+    [[ -d "${lock_dir}" && ! -L "${lock_dir}" ]] || fatal "锁目录不是安全目录: ${lock_dir}"
 
     uid="$(id -u)"
     owner="$(stat -c '%u' "${lock_dir}")" || fatal "无法读取锁目录 owner: ${lock_dir}"
@@ -319,6 +363,7 @@ kubectl_safe() {
         --kill-after=5s \
         "${KUBECTL_COMMAND_TIMEOUT}" \
         kubectl \
+        --kubeconfig="${KUBECONFIG_FILE}" \
         --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" \
         "$@" || rc=$?
 
@@ -377,7 +422,7 @@ check_rbac_permissions() {
 
 preflight() {
     check_rbac_permissions
-    log "INFO" "预检查通过: request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}"
+    log "INFO" "身份预检查通过: kubeconfig=${KUBECONFIG_FILE}, request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}"
 }
 
 fetch_cluster_data() {
@@ -389,10 +434,10 @@ fetch_cluster_data() {
     log "INFO" "开始拉取 Pod 与 ReplicaSet 数据，范围: ${NAMESPACE:-ALL_NAMESPACES}"
 
     kubectl_safe get pods "${scope_args[@]}" -o json > "${pod_json}" || \
-        fatal "获取 Pod 数据失败（可能是 RBAC、Namespace 不存在、API 请求超时或集群连接异常）"
+        fatal "获取 Pod 数据失败（可能是 RBAC、凭据失效、Namespace 不存在、API 请求超时或集群连接异常）"
 
     kubectl_safe get replicasets.apps "${scope_args[@]}" -o json > "${rs_json}" || \
-        fatal "获取 ReplicaSet 数据失败（可能是 RBAC、Namespace 不存在、API 请求超时或集群连接异常）"
+        fatal "获取 ReplicaSet 数据失败（可能是 RBAC、凭据失效、Namespace 不存在、API 请求超时或集群连接异常）"
 
     jq -e '.items | type == "array"' "${pod_json}" >/dev/null || fatal "Pod API 返回 JSON 结构异常"
     jq -e '.items | type == "array"' "${rs_json}" >/dev/null || fatal "ReplicaSet API 返回 JSON 结构异常"
@@ -432,12 +477,8 @@ extract_pod_records() {
         deployment=""
 
         case "${owner_kind}" in
-            ReplicaSet)
-                deployment="${RS_TO_DEPLOYMENT["${ns}/${owner_name}"]:-}"
-                ;;
-            Deployment)
-                deployment="${owner_name}"
-                ;;
+            ReplicaSet) deployment="${RS_TO_DEPLOYMENT["${ns}/${owner_name}"]:-}" ;;
+            Deployment) deployment="${owner_name}" ;;
         esac
 
         if [[ -z "${deployment}" || "${deployment}" == "-" ]]; then
@@ -628,7 +669,7 @@ EOF_HTML
     cat >> "${REPORT_FILE}" <<'EOF_HTML'
 </tbody>
 </table>
-<div class="footer">Generated by pod-start-time-check.sh v2.2.1</div>
+<div class="footer">Generated by pod-start-time-check.sh v2.3.0</div>
 </body>
 </html>
 EOF_HTML
@@ -769,7 +810,7 @@ main() {
     acquire_lock
     preflight
 
-    log "INFO" "开始巡检: metric=${METRIC_NAME}, namespace=${NAMESPACE:-ALL_NAMESPACES}, warn=${WARN_SECONDS}s, critical=${CRITICAL_SECONDS}s, request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}, dry_run=${DRY_RUN}"
+    log "INFO" "开始巡检: metric=${METRIC_NAME}, kubeconfig=${KUBECONFIG_FILE}, namespace=${NAMESPACE:-ALL_NAMESPACES}, warn=${WARN_SECONDS}s, critical=${CRITICAL_SECONDS}s, request_timeout=${KUBECTL_REQUEST_TIMEOUT}, command_timeout=${KUBECTL_COMMAND_TIMEOUT}, dry_run=${DRY_RUN}"
 
     fetch_cluster_data
     build_deployment_map

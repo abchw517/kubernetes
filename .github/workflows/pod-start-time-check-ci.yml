@@ -42,6 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           bash -n pod-start-time-check/pod-start-time-check.sh
+          bash -n pod-start-time-check/provision-kubeconfig.sh
           bash -n pod-start-time-check/tests/run-tests.sh
           bash -n pod-start-time-check/tests/mock-kubectl
 
@@ -51,6 +52,7 @@ jobs:
           set -euo pipefail
           shellcheck --severity=error \
             pod-start-time-check/pod-start-time-check.sh \
+            pod-start-time-check/provision-kubeconfig.sh \
             pod-start-time-check/tests/run-tests.sh \
             pod-start-time-check/tests/mock-kubectl
 
@@ -73,6 +75,10 @@ jobs:
           with open('pod-start-time-check/rbac.yaml', encoding='utf-8') as f:
               docs = list(yaml.safe_load_all(f))
 
+          service_accounts = [d for d in docs if d and d.get('kind') == 'ServiceAccount']
+          assert len(service_accounts) == 1, f'expected exactly one ServiceAccount, got {len(service_accounts)}'
+          assert service_accounts[0].get('automountServiceAccountToken') is False, 'ServiceAccount token automount must stay disabled'
+
           roles = [d for d in docs if d and d.get('kind') == 'ClusterRole']
           assert len(roles) == 1, f'expected exactly one ClusterRole, got {len(roles)}'
           rules = roles[0].get('rules', [])
@@ -91,7 +97,7 @@ jobs:
           print('RBAC exact baseline: OK')
           PY
 
-      - name: Run contract tests
+      - name: Run identity contract tests
         shell: bash
         run: |
           set -euo pipefail

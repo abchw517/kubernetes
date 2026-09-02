@@ -1,0 +1,13 @@
+{
+  "apiVersion":"v1",
+  "clusters":[{
+    "name":"cluster",
+    "cluster":{
+      "server":"https://127.0.0.1:6443",
+      "certificate-authority-data":"VEVTVENB"
+    }
+  }],
+  "contexts":[{"name":"admin","context":{"cluster":"cluster","user":"admin"}}],
+  "current-context":"admin",
+  "users":[{"name":"admin","user":{"token":"ADMIN"}}]
+}

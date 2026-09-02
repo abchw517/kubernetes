@@ -1,11 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-while [[ $# -gt 0 && "$1" == --request-timeout=* ]]; do shift; done
+raw=("$@")
+if [[ -n "${MOCK_KUBECTL_LOG:-}" ]]; then
+  printf '%s\n' "${raw[*]}" >> "${MOCK_KUBECTL_LOG}"
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --request-timeout=*|--kubeconfig=*) shift ;;
+    *) break ;;
+  esac
+done
 
 case "${1:-}" in
   version)
     exit 0
+    ;;
+  config)
+    [[ "${2:-}" == "view" ]] || exit 2
+    cat "${MOCK_FIXTURE_DIR}/admin-config-view.json"
+    ;;
+  create)
+    [[ "${2:-}" == "token" ]] || exit 2
+    echo 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6cG9kLXN0YXJ0LXRpbWUtY2hlY2stc3lzdGVtOnBvZC1zdGFydC10aW1lLWNoZWNrIn0.signature'
     ;;
   auth)
     [[ "${2:-}" == "can-i" ]] || exit 2
