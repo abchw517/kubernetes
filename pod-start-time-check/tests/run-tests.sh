@@ -15,7 +15,7 @@ run_tool() {
   local dir="${TMP}/${name}"
   mkdir -p "${dir}/logs" "${dir}/reports" "${dir}/lock"
   LOG_DIR="${dir}/logs" REPORT_DIR="${dir}/reports" LOCK_FILE="${dir}/lock/tool.lock" \
-    "$TOOL" "$@" >"${dir}/stdout" 2>"${dir}/stderr"
+    bash "$TOOL" "$@" >"${dir}/stdout" 2>"${dir}/stderr"
 }
 
 # 1. Main behavior: sorting + threshold boundaries + skip behavior.
@@ -64,7 +64,7 @@ printf 'KEEP\n' > "${dir}/target"
 ln -s "${dir}/target" "${dir}/lock/tool.lock"
 set +e
 LOG_DIR="${dir}/logs" REPORT_DIR="${dir}/reports" LOCK_FILE="${dir}/lock/tool.lock" \
-  "$TOOL" --dry-run >"${dir}/stdout" 2>"${dir}/stderr"
+  bash "$TOOL" --dry-run >"${dir}/stdout" 2>"${dir}/stderr"
 rc=$?
 set -e
 [[ "$rc" -ne 0 ]]
