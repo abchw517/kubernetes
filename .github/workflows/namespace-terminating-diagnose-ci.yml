@@ -87,10 +87,28 @@ jobs:
           python3 namespace-terminating-diagnose/tests/validate-rbac.py \
             namespace-terminating-diagnose/rbac/namespace-terminating-diagnose-readonly.yaml
 
-      - name: Run mock Kubernetes contract suite
+      - name: Run Namespace mock Kubernetes contract suite
         shell: bash
         run: |
           bash namespace-terminating-diagnose/tests/run-tests.sh
+
+      - name: Run Pod PVC PV VolumeAttachment contract suite
+        shell: bash
+        run: |
+          bash namespace-terminating-diagnose/tests/resource-run-tests.sh
+
+      - name: Validate PrometheusRule YAML
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import yaml
+
+          for path in pathlib.Path('namespace-terminating-diagnose/prometheus').glob('*.yaml'):
+              with path.open(encoding='utf-8') as f:
+                  yaml.safe_load(f)
+              print(f'YAML OK: {path}')
+          PY
 
   secret-scan:
     name: Secret Scan
