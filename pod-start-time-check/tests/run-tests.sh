@@ -5,8 +5,10 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 TOOL="${TOOL:-${ROOT}/../pod-start-time-check.sh}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+
 mkdir -p "${TMP}/bin"
-ln -s "${ROOT}/mock-kubectl" "${TMP}/bin/kubectl"
+cp "${ROOT}/mock-kubectl" "${TMP}/bin/kubectl"
+chmod 0700 "${TMP}/bin/kubectl"
 export PATH="${TMP}/bin:${PATH}"
 export MOCK_FIXTURE_DIR="${ROOT}/fixtures"
 
@@ -35,10 +37,12 @@ line_120=$(grep -n 'pod-normal120' "$out" | cut -d: -f1)
 grep -q '>120s=4, >180s=1' "$out"
 
 # 2. Strict RBAC must reject an obviously privileged identity.
+export MOCK_PRIVILEGED=1
 set +e
-MOCK_PRIVILEGED=1 run_tool privileged --dry-run
+run_tool privileged --dry-run
 rc=$?
 set -e
+unset MOCK_PRIVILEGED
 [[ "$rc" -ne 0 ]]
 grep -q 'Strict RBAC 拒绝高权限身份' "${TMP}/privileged/stderr"
 
