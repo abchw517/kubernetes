@@ -1,130 +1,105 @@
 # pod-start-time-check
 
-Kubernetes Pod 启动耗时巡检工具。面向生产集群，以**只读、最小 RBAC、API 超时保护、可审计**为核心设计，统计 Deployment 管理的 Pod 从 `PodScheduled=True` 到当前 `Ready=True` 的时间差，并对慢启动 Pod 进行分级展示、HTML 留档和企业微信通知。
+Kubernetes Deployment Pod Ready 转换耗时巡检工具。当前版本：**v2.2.0 Production Hardening**。
 
-当前版本：**v2.1.0**
+项目坚持只读、最小权限、Fail-Closed 和可审计原则；默认扫描全集群，也支持 `-n/--namespace` 限定单 Namespace。
 
-## 1. 功能
+## 1. 指标语义
 
-- 默认扫描全集群所有 Namespace。
-- `-n/--namespace` 只扫描指定 Namespace。
-- 自动解析 `Pod -> ReplicaSet -> Deployment` OwnerReference。
-- 按启动耗时从高到低排序。
-- 输出：Namespace、Deployment、Pod、启动耗时。
-- `>120s` 黄色，`>180s` 红色，阈值可调整。
-- 将 `>120s` 的记录生成 HTML 报告。
-- 可通过企业微信群机器人发送摘要和 HTML 文件。
-- 日志、`flock` 互斥锁、`--dry-run`、临时文件自动清理。
-- **v2.1.0：RBAC 最小权限预检。**
-- **v2.1.0：`kubectl --request-timeout` + GNU `timeout` 双层超时。**
-- **v2.1.0：删除 `kubectl get namespace` 预检查，不再需要 `namespaces:get`。**
-
-## 2. 启动耗时口径
-
-保持原有业务口径不变：
+v2.2.0 明确不再把当前 Condition 时间差描述成“严格的首次启动耗时”。工具实际计算：
 
 ```text
-startup_seconds =
-Ready=True condition.lastTransitionTime
+scheduled_to_current_ready_transition_seconds =
+Ready=True.lastTransitionTime
 -
-PodScheduled condition.lastTransitionTime
+PodScheduled.lastTransitionTime
 ```
 
-只统计当前存在 `Ready=True` 条件并能够关联到 Deployment 的 Pod。
+这个值适合用于发现 Scheduled 后很晚才进入**当前 Ready 状态**的 Pod，但它是代理指标：如果 Pod 启动后 Readiness 曾经从 True 变成 False，再重新变为 True，`Ready.lastTransitionTime` 会被刷新，因此结果可能大于历史首次 Ready 耗时。
 
-> 注意：该指标反映 Kubernetes Condition 的时间差。如果 Pod 在运行期间发生过 Readiness 状态反复切换，`Ready.lastTransitionTime` 可能代表最近一次重新 Ready 的时间，而不一定严格等价于容器进程第一次启动完成时间。本版本为了保持原业务逻辑，不改变这一计算口径。
+业务算法本身保持 v2.1.0 不变，只把名称和报告语义修正为准确描述。
 
-## 3. 架构与数据链路
+## 2. v2.2.0 只做七项 Production Hardening
+
+1. 安全锁目录和 symlink 防护。
+2. Strict RBAC 双向预检。
+3. `--request-timeout` / `--command-timeout` 禁止配置为 0。
+4. 使用 `jq @html` 修复 HTML escaping。
+5. 明确 Scheduled -> Current Ready Transition 指标语义。
+6. RFC3339 时间转换放入 jq，去掉每 Pod 两次 `date -d`。
+7. 增加 contract tests 和专用 GitHub Actions Gate。
+
+没有新增业务扫描目标，没有增加 Kubernetes 写操作，也没有修改 120/180 秒阈值规则、HTML 报告触发条件或企业微信发送流程。
+
+## 3. 数据链路
 
 ```text
-                         +------------------------+
-                         | pod-start-time-check.sh|
-                         +-----------+------------+
-                                     |
-                         RBAC auth can-i preflight
-                                     |
-                    +----------------+----------------+
-                    |                                 |
-                    v                                 v
-             pods:list                         replicasets:list
-                    |                                 |
-                    +----------------+----------------+
-                                     |
-                          kubectl_safe 双层超时
-                                     |
-                 +-------------------+-------------------+
-                 |                                       |
-        --request-timeout=30s                   GNU timeout=45s
-        单次 API Request                         整个 kubectl 进程
-                 |                                       |
-                 +-------------------+-------------------+
-                                     |
-                                     v
-                            本地 JSON 批量分析
-                                     |
-                  Pod -> ReplicaSet -> Deployment
-                                     |
-                                     v
-                      PodScheduled -> Ready 时间差
-                                     |
-                                     v
-                              startup_seconds
-                                     |
-                         sort DESC by seconds
-                                     |
-                +--------------------+--------------------+
-                |                    |                    |
-             <=120s              120s~180s             >180s
-              NORMAL                WARN               CRITICAL
-                                     |                    |
-                                     +----------+---------+
-                                                |
-                                                v
-                                         HTML Report
-                                                |
-                                                v
-                                      WeCom Robot(optional)
+Dedicated Kubernetes Identity
+          |
+          v
+Strict RBAC Preflight
+  | required=yes
+  | pods:list
+  | replicasets:list
+  |
+  | dangerous=no
+  | */*
+  | secrets:get
+  | pods:delete
+  | deployments:patch
+  | clusterrolebindings:create
+          |
+          v
+kubectl_safe
+  |-- request-timeout=30s
+  `-- command-timeout=45s
+          |
+          +--> get pods
+          `--> get replicasets
+                    |
+                    v
+          Local JSON processing
+                    |
+        Pod -> ReplicaSet -> Deployment
+                    |
+                    v
+        jq fromdateiso8601 conversion
+                    |
+                    v
+Scheduled -> current Ready transition
+                    |
+                    v
+              sort DESC
+                    |
+        <=120   121..180   >180
+        NORMAL    WARN    CRITICAL
+                    |
+                    v
+             HTML / WeCom
 ```
 
-## 4. RBAC 最小权限
+## 4. RBAC
 
-### 4.1 为什么脚本需要独立 RBAC
+`rbac.yaml` 的 ClusterRole 精确只有：
 
-RBAC 约束的是**脚本所使用的 Kubernetes 身份**，不是 Shell 文件本身。
+| API Group | Resource | Verb |
+|---|---|---|
+| core | pods | list |
+| apps | replicasets | list |
 
-如果仍然使用：
+脚本启动时首先确认这两个权限存在，然后执行 Strict RBAC 检查。如果当前身份在扫描范围内拥有以下明显高危权限之一，脚本 Fail Closed：
 
 ```text
-cluster-admin kubeconfig
+*/*
+secrets:get
+pods:delete
+deployments.apps:patch
+clusterrolebindings.rbac.authorization.k8s.io:create
 ```
 
-即使脚本只执行 `get/list`，该凭据仍然具有管理员权限。因此生产环境建议为该工具使用独立 ServiceAccount 或独立低权限 kubeconfig。
+Strict RBAC 是生产防误用保护，重点阻止 cluster-admin 或明显高权限 kubeconfig 被拿来运行巡检工具。它不是 Kubernetes 身份全部权限的数学证明，因此仍应使用 `rbac.yaml` 中的专用 ServiceAccount/凭据。
 
-### 4.2 v2.1.0 最小权限
-
-脚本只需要：
-
-| API Group | Resource | Verb | 用途 |
-|---|---|---|---|
-| core | pods | list | 批量获取 Pod Condition、OwnerReference |
-| apps | replicasets | list | 将 ReplicaSet 映射到 Deployment |
-
-明确**不需要**：
-
-```text
-pods:get
-pods:watch
-pods/log
-pods/exec
-namespaces:get
-nodes:*
-deployments:*
-secrets:*
-configmaps:*
-create/update/patch/delete
-```
-
-### 4.3 部署默认全集群只读 RBAC
+安装：
 
 ```bash
 kubectl apply -f rbac.yaml
@@ -135,17 +110,9 @@ kubectl apply -f rbac.yaml
 ```bash
 SA='system:serviceaccount:pod-start-time-check-system:pod-start-time-check'
 
-kubectl auth can-i list pods \
-  --all-namespaces \
-  --as="${SA}"
-
-kubectl auth can-i list replicasets.apps \
-  --all-namespaces \
-  --as="${SA}"
-
-kubectl auth can-i get secrets \
-  --all-namespaces \
-  --as="${SA}"
+kubectl auth can-i list pods -A --as="${SA}"
+kubectl auth can-i list replicasets.apps -A --as="${SA}"
+kubectl auth can-i get secrets -A --as="${SA}"
 ```
 
 预期：
@@ -156,183 +123,143 @@ yes
 no
 ```
 
-### 4.4 仅允许单 Namespace
+如果只允许某个 Namespace，请保留 ClusterRole，但用目标 Namespace 中的 RoleBinding 绑定该 ServiceAccount，不使用默认 ClusterRoleBinding。
 
-如果生产策略不允许全集群扫描，不要应用 `rbac.yaml` 中的 `ClusterRoleBinding`。保留 `ClusterRole`，改为在目标 Namespace 建立 `RoleBinding`：
+## 5. 安全锁
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: pod-start-time-check
-  namespace: pro-yunfan
-subjects:
-  - kind: ServiceAccount
-    name: pod-start-time-check
-    namespace: pod-start-time-check-system
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: pod-start-time-check
-```
-
-此时执行：
-
-```bash
-./pod-start-time-check.sh -n pro-yunfan
-```
-
-而全集群扫描会在 RBAC Preflight 阶段 Fail Closed。
-
-## 5. RBAC Preflight
-
-脚本启动后先执行：
+v2.1.0 默认锁文件位于 `/tmp`。v2.2.0 默认改为：
 
 ```text
-kubectl auth can-i list pods
-kubectl auth can-i list replicasets.apps
+/run/lock/pod-start-time-check/pod-start-time-check.lock
 ```
 
-全集群模式检查 `--all-namespaces`；`-n` 模式检查指定 Namespace。
+打开锁之前会验证：
 
-任一权限不是 `yes`：
+- 锁目录不是 symlink；
+- 锁目录 owner 必须是当前执行用户；
+- 锁目录不能 group/world writable；
+- 已存在的锁文件必须是普通文件；
+- 锁文件不能是 symlink；
+- 已存在锁文件 owner 必须是当前执行用户；
+- 锁文件权限收敛到 `0600`。
 
-```text
-RBAC 权限不足 -> 立即退出 -> 不继续扫描 -> 不生成错误报告
-```
+这用于避免高权限 cron/systemd 执行时通过 `/tmp` 预置 symlink 导致文件覆盖。
 
-v2.1.0 不再执行：
-
-```bash
-kubectl get namespace <namespace>
-```
-
-因此不会为了 Namespace 存在性检查额外申请 `namespaces:get`。
-
-如果 `-n` 指定了不存在的 Namespace，真正的 Pod List 请求会失败并终止。
-
-## 6. kubectl 双层 Timeout
-
-### 6.1 第一层：API Request Timeout
-
-默认：
-
-```text
-30s
-```
-
-对应：
-
-```bash
-kubectl --request-timeout=30s ...
-```
-
-用于限制单次 Kubernetes API Server Request。
-
-### 6.2 第二层：kubectl Command Timeout
-
-默认：
-
-```text
-45s
-```
-
-对应：
-
-```bash
-timeout --signal=TERM --kill-after=5s 45s kubectl ...
-```
-
-用于限制整个 `kubectl` 进程，避免网络、认证插件、代理、客户端异常等场景长期卡死。
-
-### 6.3 推荐关系
-
-生产环境建议：
-
-```text
-request-timeout < command-timeout
-```
-
-默认：
-
-```text
-30s < 45s
-```
-
-自定义：
+非 root 用户如果不能创建 `/run/lock/pod-start-time-check`，使用现有参数指定一个由该用户独占且不可被其他用户写入的目录：
 
 ```bash
 ./pod-start-time-check.sh \
-  --request-timeout 20s \
-  --command-timeout 30s
+  --lock-file "$HOME/.local/state/pod-start-time-check/tool.lock"
 ```
 
-也支持环境变量：
+## 6. Timeout
+
+默认：
+
+```text
+KUBECTL_REQUEST_TIMEOUT=30s
+KUBECTL_COMMAND_TIMEOUT=45s
+```
+
+双层保护：
+
+```text
+kubectl --request-timeout=30s
+GNU timeout --kill-after=5s 45s kubectl ...
+```
+
+v2.2.0 明确拒绝零超时，例如：
+
+```text
+0
+0s
+0m
+0h
+0m0s
+```
+
+因此不能通过参数误操作关闭 Timeout。
+
+## 7. 性能
+
+Kubernetes API 仍只批量读取：
 
 ```bash
-export KUBECTL_REQUEST_TIMEOUT=20s
-export KUBECTL_COMMAND_TIMEOUT=30s
+kubectl get pods ... -o json
+kubectl get replicasets.apps ... -o json
+```
+
+v2.1.0 在每个有效 Pod 上执行：
+
+```text
+date -d scheduled
+date -d ready
+```
+
+v2.2.0 改为一次 jq pipeline 使用：
+
+```jq
+fromdateiso8601
+```
+
+计算两个 RFC3339 timestamp 的 epoch 和 duration，不再产生每 Pod 两次外部 `date` 进程。
+
+`date` 仍用于日志时间和报告文件名，这部分与 Pod 数量无关。
+
+## 8. 阈值和输出
+
+规则保持不变：
+
+```text
+<=120s   NORMAL
+>120s    WARN / 黄色
+>180s    CRITICAL / 红色
+```
+
+终端输出：
+
+```text
+NAMESPACE
+DEPLOYMENT
+POD
+TRANSITION(s)
+```
+
+结果仍按 duration 从高到低排序。
+
+只有 `>120s` 的记录进入 HTML 报告。
+
+## 9. HTML 安全
+
+v2.2.0 删除 Bash parameter replacement 版本的 HTML escape，统一使用：
+
+```bash
+jq -nr --arg value "$value" '$value | @html'
+```
+
+Namespace、Deployment、Pod、扫描范围等动态字段写入 HTML 前都会 escape。
+
+## 10. 使用
+
+全集群：
+
+```bash
 ./pod-start-time-check.sh
 ```
 
-## 7. 使用方法
-
-### 7.1 依赖
-
-必需：
-
-```text
-bash 4+
-kubectl
-jq
-GNU coreutils date
-GNU coreutils timeout
-sort
-awk
-sed
-flock
-mktemp
-```
-
-启用企业微信时额外需要：
-
-```text
-curl
-```
-
-### 7.2 全集群扫描
-
-```bash
-chmod +x pod-start-time-check.sh
-./pod-start-time-check.sh
-```
-
-### 7.3 指定 Namespace
+指定 Namespace：
 
 ```bash
 ./pod-start-time-check.sh -n pro-yunfan
 ```
 
-### 7.4 Dry-run
+Dry-run：
 
 ```bash
 ./pod-start-time-check.sh --dry-run
 ```
 
-Dry-run 会执行：
-
-- RBAC Preflight
-- Pod/ReplicaSet 查询
-- Deployment 映射
-- 启动耗时计算
-- 排序和终端输出
-
-但不会：
-
-- 持久化 HTML
-- 调用企业微信机器人
-
-### 7.5 自定义阈值
+自定义阈值：
 
 ```bash
 ./pod-start-time-check.sh \
@@ -340,115 +267,102 @@ Dry-run 会执行：
   --critical-seconds 180
 ```
 
-### 7.6 企业微信
-
-生产环境建议使用环境变量，避免 Webhook 出现在 shell history 和进程参数：
+企业微信：
 
 ```bash
 export WECHAT_WEBHOOK_URL='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REDACTED'
 ./pod-start-time-check.sh
 ```
 
-仍保留 `--webhook-url` 兼容能力，但脚本会输出安全提示。
+`--webhook-url` 为兼容 v2.1.0 保留，但生产仍推荐环境变量，避免 URL/key 进入 shell history。
 
-## 8. 参数
+## 11. 参数
 
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `-n, --namespace` | ALL | 指定单 Namespace |
-| `--dry-run` | false | 不生成 HTML、不通知企业微信 |
-| `--warn-seconds` | 120 | 黄色阈值 |
-| `--critical-seconds` | 180 | 红色阈值 |
-| `--request-timeout` | 30s | kubectl 单次 API Request Timeout |
-| `--command-timeout` | 45s | 整体 kubectl Command Timeout |
-| `--webhook-url` | 空 | 企业微信机器人 Webhook；推荐环境变量 |
-| `--log-dir` | `/data/logs/pod-start-time-check` | 日志目录 |
-| `--report-dir` | `<log-dir>/reports` | HTML 目录 |
-| `--lock-file` | `/tmp/pod-start-time-check.lock` | flock 锁文件 |
+| 参数 | 默认值 |
+|---|---|
+| `-n, --namespace` | ALL |
+| `--dry-run` | false |
+| `--warn-seconds` | 120 |
+| `--critical-seconds` | 180 |
+| `--request-timeout` | 30s |
+| `--command-timeout` | 45s |
+| `--webhook-url` | empty |
+| `--log-dir` | `/data/logs/pod-start-time-check` |
+| `--report-dir` | `<log-dir>/reports` |
+| `--lock-file` | `/run/lock/pod-start-time-check/pod-start-time-check.lock` |
 
-环境变量：
+## 12. Contract Tests
 
-```text
-WARN_SECONDS
-CRITICAL_SECONDS
-KUBECTL_REQUEST_TIMEOUT
-KUBECTL_COMMAND_TIMEOUT
-LOG_DIR
-REPORT_DIR
-LOCK_FILE
-WECHAT_WEBHOOK_URL
-KUBECONFIG
-```
-
-## 9. 日志与报告
-
-默认日志：
+目录：
 
 ```text
-/data/logs/pod-start-time-check/
-└── pod-start-time-check-YYYYMMDD.log
+tests/
+├── run-tests.sh
+├── mock-kubectl
+└── fixtures/
+    ├── pods.json
+    └── replicasets.json
 ```
 
-HTML：
+覆盖：
 
 ```text
-/data/logs/pod-start-time-check/reports/
-└── pod-start-time-report-YYYYMMDD-HHMMSS.html
+120s  -> NORMAL
+121s  -> WARN
+180s  -> WARN
+181s  -> CRITICAL
+
+结果按耗时降序
+Ready=False 跳过
+非 Deployment Pod 跳过
+Strict RBAC 拒绝高权限身份
+request-timeout=0 拒绝
+command-timeout=0 拒绝
+symlink lock 拒绝且不截断目标文件
+HTML escaping 正确
+HTML 包含准确指标语义
+脚本不存在 per-Pod date -d
 ```
 
-脚本设置：
+本地：
 
 ```bash
-umask 077
+bash tests/run-tests.sh
 ```
 
-新建日志、临时文件和报告默认只允许当前执行用户访问，降低信息泄露风险。
+## 13. 专用 CI
 
-## 10. Exit / Fail-Closed 行为
-
-以下情况直接失败，不继续产生业务报告：
-
-- 缺少必需命令。
-- GNU `date -d` 不可用。
-- Timeout 参数格式无效。
-- `kubectl` Client 不可用。
-- `pods:list` 权限不足。
-- `replicasets.apps:list` 权限不足。
-- Kubernetes API 请求失败。
-- kubectl 整体命令超时。
-- Namespace 不存在。
-
-企业微信发送失败**不会改变巡检计算结果**；HTML 已生成时会保留本地报告并记录错误日志。
-
-## 11. 输出示例
+`.github/workflows/pod-start-time-check-ci.yml` 包含：
 
 ```text
-Pod 启动耗时巡检结果
-NAMESPACE                    DEPLOYMENT                                       POD                                                                     STARTUP(s)
-pro-yunfan                   yunfan-order                                     yunfan-order-7d6c9b8b56-abcde                                               235s
-pro-yunfan                   yunfan-app-api                                   yunfan-app-api-78cb5f7d9-xabcd                                              160s
-pro-yunfan                   yunfan-user                                      yunfan-user-6f98c5c8cc-xyz12                                                48s
+bash -n
+ShellCheck --severity=error
+yamllint
+RBAC exact baseline validation
+contract tests
 ```
 
-颜色规则：
+RBAC CI 使用 exact-set 校验，只接受：
 
 ```text
-<= 120s    默认
-> 120s     黄色
-> 180s     红色
+('', 'pods', 'list')
+('apps', 'replicasets', 'list')
 ```
 
-## 12. v2.1.0 变更
+任何新增 Kubernetes 权限都会导致 Gate 失败。
 
-与 v2.0.0 相比：
+## 14. Production Hardening 结论
 
-1. 新增 `check_rbac_permissions()`。
-2. 最小权限固定为 `pods:list`、`replicasets.apps:list`。
-3. 删除 Namespace `get` 预检查和 `namespaces:get` 权限依赖。
-4. 新增 `kubectl_safe()`，统一包装所有 Kubernetes API 调用。
-5. 新增 `KUBECTL_COMMAND_TIMEOUT=45s`。
-6. 保留 `KUBECTL_REQUEST_TIMEOUT=30s`，形成双层 Timeout。
-7. 新增 `--request-timeout`、`--command-timeout` 参数。
-8. 新增独立 `rbac.yaml`。
-9. 增加 `umask 077`。
-10. 原 Pod 启动耗时计算、排序、阈值、HTML、企业微信业务逻辑不变。
+v2.2.0 不试图扩大工具能力，而是收紧运行边界：
+
+```text
+Read Only
++ Least Privilege RBAC
++ Strict RBAC Guard
++ Safe Lock
++ Non-zero Timeout
++ Correct HTML Escape
++ Accurate Metric Semantics
++ No per-Pod date fork
++ Contract CI
+```

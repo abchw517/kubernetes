@@ -1,0 +1,12 @@
+{
+  "apiVersion":"v1",
+  "items":[
+    {"metadata":{"namespace":"ns1","name":"pod-critical","ownerReferences":[{"kind":"ReplicaSet","name":"rs-critical","controller":true}]},"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"2026-09-02T00:00:00Z"},{"type":"Ready","status":"True","lastTransitionTime":"2026-09-02T00:03:01Z"}]}},
+    {"metadata":{"namespace":"ns1","name":"pod-warn180","ownerReferences":[{"kind":"ReplicaSet","name":"rs-warn180","controller":true}]},"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"2026-09-02T00:00:00Z"},{"type":"Ready","status":"True","lastTransitionTime":"2026-09-02T00:03:00Z"}]}},
+    {"metadata":{"namespace":"ns1","name":"pod-warn121","ownerReferences":[{"kind":"ReplicaSet","name":"rs-warn121","controller":true}]},"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"2026-09-02T00:00:00Z"},{"type":"Ready","status":"True","lastTransitionTime":"2026-09-02T00:02:01Z"}]}},
+    {"metadata":{"namespace":"ns1","name":"pod-normal120","ownerReferences":[{"kind":"ReplicaSet","name":"rs-normal120","controller":true}]},"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"2026-09-02T00:00:00Z"},{"type":"Ready","status":"True","lastTransitionTime":"2026-09-02T00:02:00Z"}]}},
+    {"metadata":{"namespace":"ns1","name":"pod-notready","ownerReferences":[{"kind":"ReplicaSet","name":"rs-notready","controller":true}]},"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"2026-09-02T00:00:00Z"},{"type":"Ready","status":"False","lastTransitionTime":"2026-09-02T00:10:00Z"}]}},
+    {"metadata":{"namespace":"ns1","name":"pod-stateful","ownerReferences":[{"kind":"StatefulSet","name":"sts1","controller":true}]},"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"2026-09-02T00:00:00Z"},{"type":"Ready","status":"True","lastTransitionTime":"2026-09-02T00:04:00Z"}]}},
+    {"metadata":{"namespace":"ns1","name":"pod-html","ownerReferences":[{"kind":"ReplicaSet","name":"rs-html","controller":true}]},"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"2026-09-02T00:00:00Z"},{"type":"Ready","status":"True","lastTransitionTime":"2026-09-02T00:02:30Z"}]}}
+  ]
+}

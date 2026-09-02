@@ -1,0 +1,11 @@
+{
+  "apiVersion":"v1",
+  "items":[
+    {"metadata":{"namespace":"ns1","name":"rs-critical","ownerReferences":[{"kind":"Deployment","name":"dep-critical","controller":true}]}},
+    {"metadata":{"namespace":"ns1","name":"rs-warn180","ownerReferences":[{"kind":"Deployment","name":"dep-warn180","controller":true}]}},
+    {"metadata":{"namespace":"ns1","name":"rs-warn121","ownerReferences":[{"kind":"Deployment","name":"dep-warn121","controller":true}]}},
+    {"metadata":{"namespace":"ns1","name":"rs-normal120","ownerReferences":[{"kind":"Deployment","name":"dep-normal120","controller":true}]}},
+    {"metadata":{"namespace":"ns1","name":"rs-notready","ownerReferences":[{"kind":"Deployment","name":"dep-notready","controller":true}]}},
+    {"metadata":{"namespace":"ns1","name":"rs-html","ownerReferences":[{"kind":"Deployment","name":"dep<&\"","controller":true}]}}
+  ]
+}

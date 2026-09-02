@@ -1,0 +1,98 @@
+name: Pod Start Time Check Gate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'pod-start-time-check/**'
+      - '.github/workflows/pod-start-time-check-ci.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'pod-start-time-check/**'
+      - '.github/workflows/pod-start-time-check-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pod-start-time-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  production-gate:
+    name: Production hardening contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck yamllint jq python3-yaml
+
+      - name: Bash syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n pod-start-time-check/pod-start-time-check.sh
+          bash -n pod-start-time-check/tests/run-tests.sh
+          bash -n pod-start-time-check/tests/mock-kubectl
+
+      - name: ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck --severity=error \
+            pod-start-time-check/pod-start-time-check.sh \
+            pod-start-time-check/tests/run-tests.sh \
+            pod-start-time-check/tests/mock-kubectl
+
+      - name: YAML lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          yamllint \
+            --config-data '{extends: default, rules: {document-start: disable, line-length: disable, truthy: {check-keys: false}}}' \
+            pod-start-time-check/rbac.yaml \
+            .github/workflows/pod-start-time-check-ci.yml
+
+      - name: Validate exact RBAC baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import yaml
+
+          with open('pod-start-time-check/rbac.yaml', encoding='utf-8') as f:
+              docs = list(yaml.safe_load_all(f))
+
+          roles = [d for d in docs if d and d.get('kind') == 'ClusterRole']
+          assert len(roles) == 1, f'expected exactly one ClusterRole, got {len(roles)}'
+          rules = roles[0].get('rules', [])
+          actual = set()
+          for rule in rules:
+              for group in rule.get('apiGroups', []):
+                  for resource in rule.get('resources', []):
+                      for verb in rule.get('verbs', []):
+                          actual.add((group, resource, verb))
+
+          expected = {
+              ('', 'pods', 'list'),
+              ('apps', 'replicasets', 'list'),
+          }
+          assert actual == expected, f'RBAC drift detected: {actual!r}'
+          print('RBAC exact baseline: OK')
+          PY
+
+      - name: Run contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash pod-start-time-check/tests/run-tests.sh
