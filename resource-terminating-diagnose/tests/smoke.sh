@@ -39,6 +39,14 @@ JSON
   "get node node-a")
     echo '{"metadata":{"name":"node-a"},"spec":{},"status":{"conditions":[{"type":"Ready","status":"True","reason":"KubeletReady"}]}}'
     ;;
+  "get pvc custom-pvc -n prod")
+    cat <<'JSON'
+{"metadata":{"uid":"pvcuid","name":"custom-pvc","namespace":"prod","deletionTimestamp":"2020-01-01T00:00:00Z","finalizers":["example.com/external-cleanup"]},"spec":{},"status":{"phase":"Bound"}}
+JSON
+    ;;
+  "get pods -n prod")
+    echo '{"items":[]}'
+    ;;
   "get events -n prod")
     cat <<'JSON'
 {"items":[{"metadata":{"namespace":"prod","creationTimestamp":"2026-09-02T01:00:00Z"},"involvedObject":{"uid":"poduid","kind":"Pod","name":"web-0"},"type":"Warning","reason":"FailedKillPod","message":"error killing pod","count":2,"lastTimestamp":"2026-09-02T01:00:00Z"}]}
@@ -73,6 +81,16 @@ set -e
 [[ $rc -eq 30 ]]
 jq -e '.forceCheck.decision=="BREAK-GLASS-REVIEW-READY"' "$tmp/force.json" >/dev/null
 jq -e '.eventRootCauses | any(.category=="POD_TERMINATION")' "$tmp/force.json" >/dev/null
+
+# Unknown/custom finalizers must fail closed instead of becoming Break-Glass ready.
+set +e
+PATH="$tmp/bin:$PATH" "$TOOL" force-check pvc custom-pvc -n prod --json >"$tmp/custom-finalizer.json"
+rc=$?
+set -e
+[[ $rc -eq 20 ]]
+jq -e '.forceCheck.decision=="BLOCKED"' "$tmp/custom-finalizer.json" >/dev/null
+jq -e '.forceCheck.blockers | index("UNKNOWN_OR_CUSTOM_FINALIZER_REQUIRES_CONTROLLER_REVIEW") != null' \
+  "$tmp/custom-finalizer.json" >/dev/null
 
 PATH="$tmp/bin:$PATH" "$TOOL" scan \
   --threshold-seconds 600 \
