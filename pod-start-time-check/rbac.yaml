@@ -1,0 +1,60 @@
+# pod-start-time-check v2.1.0
+# 默认 RBAC：允许扫描全集群所有 Namespace。
+# 最小权限仅包含：
+#   - core/pods: list
+#   - apps/replicasets: list
+#
+# 注意：RBAC 约束的是“执行脚本所使用的 Kubernetes 身份”，不是脚本文件本身。
+# 请确保脚本实际使用该 ServiceAccount 对应的凭据，而不是 cluster-admin kubeconfig。
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pod-start-time-check-system
+  labels:
+    app.kubernetes.io/name: pod-start-time-check
+    app.kubernetes.io/part-of: kubernetes-ops-tools
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-start-time-check
+  namespace: pod-start-time-check-system
+  labels:
+    app.kubernetes.io/name: pod-start-time-check
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-start-time-check
+  labels:
+    app.kubernetes.io/name: pod-start-time-check
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - list
+
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-start-time-check
+  labels:
+    app.kubernetes.io/name: pod-start-time-check
+subjects:
+  - kind: ServiceAccount
+    name: pod-start-time-check
+    namespace: pod-start-time-check-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-start-time-check
